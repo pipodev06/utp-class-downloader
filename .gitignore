@@ -1,0 +1,19 @@
+# credenciales — nunca subir
+.env
+
+# sesión Playwright — contiene cookies de autenticación
+sesion/
+
+# entorno virtual Python
+venv/
+
+# carpeta de materiales descargados
+descargas/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code
+.claude/
