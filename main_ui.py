@@ -1,4 +1,5 @@
 import sys
+import subprocess
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -255,6 +256,35 @@ QProgressBar::chunk {{
     border-radius: 5px;
 }}
 """
+
+class ChromiumWorker(QThread):
+    """Verifica/instala el Chromium de Playwright al abrir la app.
+    Funciona tanto corriendo como script como empaquetado en .exe (PyInstaller) —
+    invoca el driver interno de Playwright directo, sin depender de 'python -m'."""
+    log = Signal(str, str, str)
+    terminado = Signal(bool)
+
+    def run(self):
+        try:
+            from playwright._impl._driver import compute_driver_executable, get_driver_env
+            driver_executable, driver_cli = compute_driver_executable()
+            self.log.emit("INFO", "gray", "Verificando Chromium (primera vez puede tardar unos minutos)...")
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            resultado = subprocess.run(
+                [str(driver_executable), str(driver_cli), "install", "chromium"],
+                env=get_driver_env(), capture_output=True, text=True,
+                creationflags=flags,
+            )
+            if resultado.returncode == 0:
+                self.log.emit("SUCCESS", "#22c55e", "Chromium listo")
+                self.terminado.emit(True)
+            else:
+                self.log.emit("WARN", ORANGE, f"No se pudo preparar Chromium: {resultado.stderr[:300]}")
+                self.terminado.emit(False)
+        except Exception as e:
+            self.log.emit("WARN", ORANGE, f"Error verificando Chromium: {e}")
+            self.terminado.emit(False)
+
 
 class ScraperWorker(QThread):
     log = Signal(str, str, str)   # nivel, color, mensaje
@@ -679,6 +709,20 @@ class VentanaPrincipal(QMainWindow):
         self._cola_seleccionados = []
         self._labels_estado = {}
         self._detectado = {}
+
+        self._preparar_chromium()
+
+    def _preparar_chromium(self):
+        self.btn_iniciar.setEnabled(False)
+        self.label_estado.setText("Preparando Chromium...")
+        self.chromium_worker = ChromiumWorker()
+        self.chromium_worker.log.connect(self._log)
+        self.chromium_worker.terminado.connect(self._chromium_listo)
+        self.chromium_worker.start()
+
+    def _chromium_listo(self, exito: bool):
+        self.btn_iniciar.setEnabled(True)
+        self.label_estado.setText("" if exito else "Chromium no disponible — revisa los logs")
 
     def _abrir_logs(self):
         self.logs_window.show()
