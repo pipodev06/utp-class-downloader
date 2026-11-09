@@ -36,6 +36,9 @@ def resolver_ciclo(periodo: str) -> str:
 
 
 def sanitizar(nombre: str) -> str:
+    """Nombre válido en Windows. Los saltos de línea/tabs (vienen en algunos títulos del portal)
+    pasan a espacio: un '\\n' en la ruta abortaba la descarga entera (WinError 123)."""
+    nombre = re.sub(r"\s*[\x00-\x1f]+\s*", " ", nombre)
     return re.sub(r'[\\/:*?"<>|]', "_", nombre).strip()[:120]
 
 SKIP_TIPOS = {"HTML", "FORUM", "TASK", "QUIZ", "SURVEY", "URL",

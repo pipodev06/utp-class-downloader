@@ -1040,6 +1040,8 @@ class VentanaPrincipal(QMainWindow):
         self.progreso_bar.setVisible(False)
         self._log("SUCCESS", GREEN, f"Descarga terminada — {resumen.get('ok', 0)} ok, {resumen.get('fail', 0)} fallidos")
         self.detectar_descargas()
+        if resumen.get("zoom_login"):
+            self.label_estado.setText("Zoom pide iniciar sesión — las clases no se pudieron bajar (revisa los logs)")
 
     def _actualizar_progreso(self, actual: int, total: int):
         self.progreso_bar.setVisible(True)

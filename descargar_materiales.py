@@ -27,8 +27,11 @@ def _descargar_archivo(http: requests.Session, url: str, destino: Path) -> str |
                     f.write(chunk)
         parcial.replace(destino)
         return None
-    except (requests.RequestException, OSError) as e:
-        parcial.unlink(missing_ok=True)
+    except (requests.RequestException, OSError, ValueError) as e:
+        try:
+            parcial.unlink(missing_ok=True)
+        except OSError:
+            pass   # ruta inválida: no hay nada que borrar; el error real ya va en el mensaje
         return str(e)
 
 
@@ -59,7 +62,10 @@ def descargar_materiales(
                    for nombre, url, destino in pendientes}
         for i, fut in enumerate(as_completed(futuros), start=1):
             nombre, destino = futuros[fut]
-            error = fut.result()
+            try:
+                error = fut.result()
+            except Exception as e:   # un archivo raro nunca debe cortar los demás
+                error = f"error inesperado: {e}"
             if error is None:
                 ok += 1
                 log("SUCCESS", "#22c55e", f"{nombre} — {destino.name}")

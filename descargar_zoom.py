@@ -18,6 +18,10 @@ ERRORES_ZOOM = [
 ]
 
 
+class ZoomPideLogin(Exception):
+    """La grabación redirigió a 'Sign In | Zoom': la sesión no tiene cookies de Zoom (SSO UTP vía Microsoft)."""
+
+
 def exportar_sesion(sesion_dir: str) -> dict:
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(user_data_dir=sesion_dir, headless=True)
@@ -67,6 +71,9 @@ def _descargar_uno(rec: dict, storage_state: dict, base_dir: Path) -> tuple[bool
             page.goto(play_url, wait_until="domcontentloaded", timeout=40000)
             page.wait_for_timeout(3000)
 
+            if "zoom.us/signin" in page.url or "/web/sso/" in page.url:
+                raise ZoomPideLogin()   # sin cookies de Zoom: no tiene sentido esperar ni marcar .fail
+
             body = (page.inner_text("body") or "").lower()
             for err in ERRORES_ZOOM:
                 if err in body:
@@ -108,6 +115,8 @@ def _descargar_uno(rec: dict, storage_state: dict, base_dir: Path) -> tuple[bool
                             return False, f"no existe (omitida): {titulo[:50]}"
                 page.wait_for_timeout(1000)
 
+        except ZoomPideLogin:
+            raise
         except Exception:
             pass
         finally:
@@ -162,6 +171,7 @@ def descargar_zoom(
     ok = 0
     fail = 0
     procesados = 0
+    pide_login = False
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futuros = {pool.submit(_descargar_uno, r, storage, base): r for r in pendientes}
         for fut in as_completed(futuros):
@@ -174,10 +184,18 @@ def descargar_zoom(
                 else:
                     fail += 1
                     log("WARN", "#f59e0b", msg)
+            except ZoomPideLogin:
+                if not pide_login:   # se corta todo: las demás grabaciones darían lo mismo
+                    pide_login = True
+                    pool.shutdown(wait=False, cancel_futures=True)
             except Exception as e:
                 fail += 1
                 log("WARN", "#f59e0b", f"excepción: {e}")
             progreso(procesados, total)
 
+    if pide_login:
+        log("WARN", "#f59e0b", "Zoom pide iniciar sesión (SSO UTP con Microsoft) — descarga detenida, "
+            "no se marcó ninguna grabación como fallida")
+        return {"ok": ok, "fail": fail, "zoom_login": True}
     log("SUCCESS", "#22c55e", f"Descarga Zoom completa — {ok} ok, {fail} fallidas")
     return {"ok": ok, "fail": fail}
