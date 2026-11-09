@@ -1,5 +1,7 @@
 import sys
+import logging
 import subprocess
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -22,6 +24,16 @@ import descargar_materiales
 import descargar_zoom
 
 SESION_DIR = str(Path(__file__).parent / "sesion")
+
+# log persistente en logs/app.log (rota a 1 MB, guarda 3 copias)
+LOGS_DIR = Path(__file__).parent / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+_handler = RotatingFileHandler(LOGS_DIR / "app.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger = logging.getLogger("utp")
+logger.setLevel(logging.INFO)
+logger.addHandler(_handler)
+sys.excepthook = lambda tipo, valor, tb: logger.critical("Excepción no capturada", exc_info=(tipo, valor, tb))
 BASE_URL = "https://class.utp.edu.pe"
 
 DARK_BG = "#0e1013"
@@ -983,6 +995,7 @@ class VentanaPrincipal(QMainWindow):
 
     def _log(self, nivel: str, color: str, mensaje: str):
         self.logs_window.agregar(nivel, color, mensaje)
+        logger.log(logging.WARNING if nivel == "WARN" else logging.INFO, "%s | %s", nivel, mensaje)
 
 
 if __name__ == "__main__":
