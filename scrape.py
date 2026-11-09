@@ -6,10 +6,14 @@ import base64
 import html
 import json
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import unquote
 
 import requests
+import requests.adapters
 from playwright.sync_api import sync_playwright
 
 import auth
@@ -76,27 +80,74 @@ def obtener_token(sesion_dir: str, log=print) -> tuple[str, str, dict]:
     if not token:
         raise RuntimeError("No se capturó el token — verifica que el portal carga correctamente")
 
-    payload = token.split(".")[1]
-    payload += "=" * (4 - len(payload) % 4)
-    decoded = json.loads(base64.b64decode(payload))
-    student_id = decoded.get("sub", "")
-
+    student_id = _claims(token).get("sub", "")
     log("SUCCESS", "#22c55e", f"Sesión iniciada y guardada — Student ID: {student_id}")
     return token, student_id, capturado.get("headers", {})
 
 
-def api_get(url: str, headers: dict):
+def _claims(token: str) -> dict:
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))   # JWT usa base64 URL-safe
+
+
+# El Bearer del portal dura 24 h: se guarda junto a la sesión de Playwright (sesion/, ignorada
+# por git, ya contiene las cookies) y se reutiliza sin abrir Chromium mientras le queden > 10 min.
+_MARGEN_TOKEN = 600
+PARALELO_API = 8   # medido: 26 cursos en 2,1 s con 8 a la vez vs 27,8 s en serie
+
+
+def _ruta_token(sesion_dir: str) -> Path:
+    return Path(sesion_dir) / "token.json"
+
+
+def token_vigente(sesion_dir: str) -> bool:
     try:
-        res = requests.get(url, headers=headers, timeout=30)
+        datos = json.loads(_ruta_token(sesion_dir).read_text(encoding="utf-8"))
+        return datos["exp"] - time.time() > _MARGEN_TOKEN
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def invalidar_token(sesion_dir: str):
+    _ruta_token(sesion_dir).unlink(missing_ok=True)
+
+
+def sesion_api(sesion_dir: str, log=print) -> tuple[str, requests.Session]:
+    """(student_id, Session HTTP con el Bearer). Reutiliza el token guardado si sigue vigente;
+    si no, abre Chromium, se loguea y guarda el nuevo."""
+    if token_vigente(sesion_dir):
+        datos = json.loads(_ruta_token(sesion_dir).read_text(encoding="utf-8"))
+        headers, student_id = datos["headers"], datos["student_id"]
+        hasta = time.strftime("%d/%m %H:%M", time.localtime(datos["exp"]))
+        log("INFO", "gray", f"Sesión reutilizada (vigente hasta {hasta}) — sin abrir el navegador")
+    else:
+        token, student_id, headers = obtener_token(sesion_dir, log=log)
+        Path(sesion_dir).mkdir(exist_ok=True)
+        _ruta_token(sesion_dir).write_text(
+            json.dumps({"headers": headers, "student_id": student_id, "exp": _claims(token)["exp"]}),
+            encoding="utf-8",
+        )
+    http = requests.Session()
+    http.headers.update(headers)
+    adaptador = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=PARALELO_API * 2)
+    http.mount("https://", adaptador)
+    return student_id, http
+
+
+def api_get(url: str, http: requests.Session):
+    """JSON de la API, o None si falla (red, 401/403 de token vencido, etc.)."""
+    try:
+        res = http.get(url, timeout=30)
         if not res.ok:
             return None
         return res.json()
-    except Exception:
+    except (requests.RequestException, ValueError):
         return None
 
 
-def obtener_cursos(student_id: str, headers: dict) -> list[dict]:
-    data = api_get(f"{API}/learning/student/{student_id}/dashboard-courses", headers)
+def obtener_cursos(student_id: str, http: requests.Session) -> list[dict]:
+    data = api_get(f"{API}/learning/student/{student_id}/dashboard-courses", http)
     if not data:
         return []
     items = data if isinstance(data, list) else data.get("data", [])
@@ -112,10 +163,11 @@ def obtener_cursos(student_id: str, headers: dict) -> list[dict]:
     return cursos
 
 
-def obtener_contenido(course_id: str, section_id: str, headers: dict) -> list[dict]:
-    resp = api_get(f"{API}/course/student/courses/{course_id}/sections/{section_id}/full", headers)
-    if not resp:
-        return []
+def obtener_contenido(course_id: str, section_id: str, http: requests.Session) -> list[dict] | None:
+    """Contenidos del curso con su semana en '_week'. None si la API falló (≠ curso vacío)."""
+    resp = api_get(f"{API}/course/student/courses/{course_id}/sections/{section_id}/full", http)
+    if resp is None:
+        return None
     items = []
     for unity in (resp.get("data") or {}).get("unities", []):
         for theme in unity.get("themes", []):
@@ -126,13 +178,13 @@ def obtener_contenido(course_id: str, section_id: str, headers: dict) -> list[di
     return items
 
 
-def obtener_zoom(course_id: str, section_id: str, headers: dict) -> list[dict]:
+def obtener_zoom(course_id: str, section_id: str, http: requests.Session) -> list[dict] | None:
     resp = api_get(
         f"{API}/course/student/video-conference/meeting"
-        f"?courseId={course_id}&sectionId={section_id}", headers,
+        f"?courseId={course_id}&sectionId={section_id}", http,
     )
-    if not resp:
-        return []
+    if resp is None:
+        return None
     return (resp.get("data") or {}).get("listVideoConferenceResponse", [])
 
 
@@ -302,6 +354,7 @@ def extraer_tareas(items: list[dict], curso: dict) -> list[dict]:
             continue
         semana = item.get("_week") or 0
         tareas.append({
+            "id": item.get("contentId") or "",
             "curso": curso["nombre"],
             "tipo": TIPOS_TAREA[tipo],
             "titulo": (item.get("title") or "").strip(),
@@ -318,37 +371,110 @@ def extraer_tareas(items: list[dict], curso: dict) -> list[dict]:
     return tareas
 
 
+def _armar_entrada(curso: dict, http: requests.Session) -> dict:
+    """Una entrada por curso con TODO lo necesario para descargar sin volver a consultar la API."""
+    items = obtener_contenido(curso["courseId"], curso["sectionId"], http)
+    zoom = obtener_zoom(curso["courseId"], curso["sectionId"], http)
+    return {
+        "nombre": curso["nombre"], "periodo": resolver_ciclo(curso["periodo"]),
+        "courseId": curso["courseId"], "sectionId": curso["sectionId"],
+        "materiales": materiales_descargables(items or []),   # [{archivo, url}]
+        "videos": grabaciones(zoom or []),                     # [{titulo, archivo, url}]
+        "youtube": enlaces_youtube(items or []),
+        "tareas": extraer_tareas(items or [], curso),
+        "error": items is None or zoom is None,
+    }
+
+
 def listar_todo(
     sesion_dir: str, log=print,
     progreso=lambda actual, total: None,
     curso_listo=lambda curso: None,
+    previos: list[dict] | None = None,
 ) -> list[dict]:
-    """Login + token + recorre todos los cursos. Retorna una entrada por curso con los
-    nombres de archivo esperados (para comparar con el disco) y sus tareas.
-    Llama curso_listo(curso) apenas cada uno termina, para poder pintarlo en vivo."""
-    _, student_id, headers = obtener_token(sesion_dir, log=log)
+    """Recorre todos los cursos en paralelo (orden original). Si un curso falla en la API,
+    se usa su versión de 'previos' (último listado) para no perder datos.
+    Llama curso_listo(curso) apenas cada uno está listo, para pintarlo en vivo."""
+    student_id, http = sesion_api(sesion_dir, log=log)
 
     log("INFO", "gray", "Consultando cursos...")
-    cursos = obtener_cursos(student_id, headers)
+    cursos = obtener_cursos(student_id, http)
+    if not cursos:   # el token guardado pudo ser revocado: un reintento con login nuevo
+        invalidar_token(sesion_dir)
+        student_id, http = sesion_api(sesion_dir, log=log)
+        cursos = obtener_cursos(student_id, http)
+    if not cursos:
+        raise RuntimeError("La API no devolvió cursos — revisa tu conexión o vuelve a intentar")
     log("SUCCESS", "#22c55e", f"{len(cursos)} cursos encontrados")
 
+    por_nombre = {c["nombre"]: c for c in previos or []}
     total = len(cursos)
     resultado = []
-    for i, curso in enumerate(cursos, start=1):
-        items = obtener_contenido(curso["courseId"], curso["sectionId"], headers)
-        materiales = [m["archivo"] for m in materiales_descargables(items)]
-        videos = [g["archivo"] for g in grabaciones(obtener_zoom(curso["courseId"], curso["sectionId"], headers))]
-        tareas = extraer_tareas(items, curso)
-        entrada = {
-            "nombre": curso["nombre"], "periodo": resolver_ciclo(curso["periodo"]),
-            "materiales": materiales, "videos": videos, "tareas": tareas,
-        }
-        resultado.append(entrada)
-        log("INFO", "gray", f"{curso['nombre']}: {len(materiales)} materiales, {len(videos)} videos, {len(tareas)} tareas")
-        progreso(i, total)
-        curso_listo(entrada)
+    with ThreadPoolExecutor(PARALELO_API) as pool:
+        for i, entrada in enumerate(pool.map(lambda c: _armar_entrada(c, http), cursos), start=1):
+            if entrada["error"]:
+                previo = por_nombre.get(entrada["nombre"])
+                log("WARN", "#f59e0b", f"{entrada['nombre']}: la API falló"
+                    + (" — se muestra el último listado" if previo else ""))
+                entrada = previo or entrada
+            resultado.append(entrada)
+            log("INFO", "gray", f"{entrada['nombre']}: {len(entrada['materiales'])} materiales, "
+                f"{len(entrada['videos'])} videos, {len(entrada['tareas'])} tareas")
+            progreso(i, total)
+            curso_listo(entrada)
 
+    fusionar_vistos(resultado, previos)
     return resultado
+
+
+# ── caché del último listado + detección de tareas nuevas ──
+
+DIAS_NUEVA = 3   # una tarea se marca "Nueva" los primeros 3 días desde que apareció
+
+
+def fusionar_vistos(cursos: list[dict], previos: list[dict] | None):
+    """Pone en cada tarea 'visto' = cuándo apareció por primera vez.
+    Sin listado previo (primera vez) todas quedan como ya conocidas ('visto' vacío)."""
+    if not previos:
+        for c in cursos:
+            for t in c["tareas"]:
+                t.setdefault("visto", "")
+        return
+    vistos = {t["id"]: t.get("visto", "") for c in previos for t in c["tareas"]}
+    ahora = datetime.now().isoformat(timespec="minutes")
+    for c in cursos:
+        for t in c["tareas"]:
+            t["visto"] = vistos.get(t["id"], ahora)
+
+
+def es_nueva(tarea: dict) -> bool:
+    visto = tarea.get("visto")
+    if not visto:
+        return False
+    return datetime.now() - datetime.fromisoformat(visto) < timedelta(days=DIAS_NUEVA)
+
+
+VERSION_CACHE = 1   # subir si cambia la forma de las entradas: la caché vieja se ignora
+
+
+def guardar_cache(ruta: Path, cursos: list[dict]):
+    ruta.parent.mkdir(exist_ok=True)
+    datos = {"version": VERSION_CACHE, "fecha": datetime.now().isoformat(timespec="minutes"),
+             "cursos": [{k: v for k, v in c.items() if k != "disco"} for c in cursos]}
+    temporal = ruta.with_suffix(".tmp")
+    temporal.write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
+    temporal.replace(ruta)   # escritura atómica: un cierre a medias no corrompe la caché
+
+
+def cargar_cache(ruta: Path) -> tuple[str, list[dict]] | None:
+    """(fecha, cursos) del último listado, o None si no hay caché o es de otra versión."""
+    try:
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        if datos.get("version") != VERSION_CACHE:
+            return None
+        return datos["fecha"], datos["cursos"]
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def estado_en_disco(base_dir: str, curso: dict) -> dict:
@@ -358,10 +484,10 @@ def estado_en_disco(base_dir: str, curso: dict) -> dict:
     archivos_dir = carpeta / "archivos"
     videos_dir = carpeta / "videos"
     return {
-        "materiales_ok": sum((archivos_dir / a).exists() for a in curso["materiales"]),
-        "videos_ok": sum((videos_dir / f"{v}.mp4").exists() for v in curso["videos"]),
+        "materiales_ok": sum((archivos_dir / m["archivo"]).exists() for m in curso["materiales"]),
+        "videos_ok": sum((videos_dir / f"{v['archivo']}.mp4").exists() for v in curso["videos"]),
         "videos_no_disp": sum(
-            (videos_dir / f"{v}.skip").exists() and not (videos_dir / f"{v}.mp4").exists()
+            (videos_dir / f"{v['archivo']}.skip").exists() and not (videos_dir / f"{v['archivo']}.mp4").exists()
             for v in curso["videos"]
         ),
     }

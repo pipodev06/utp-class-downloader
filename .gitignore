@@ -33,3 +33,6 @@ config.json
 
 # salida de scripts/check-*
 .check/
+
+# caché del último listado (incluye enlaces y tareas)
+cache/

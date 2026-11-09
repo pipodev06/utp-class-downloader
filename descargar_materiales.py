@@ -1,81 +1,72 @@
 """
-Descarga real de materiales (PDF/PPTX/DOCX/... y los enlazados dentro de las lecturas)
-— flujo independiente del listado. Hace su propio login + recorrido de cursos, y guarda en:
+Descarga de materiales (PDF/PPTX/DOCX/... y los enlazados dentro de las lecturas) a partir de lo
+que ya listó scrape.listar_todo — sin login ni nuevas consultas a la API (los archivos están en S3
+y se bajan sin sesión). Guarda en:
   BASE_DIR/<ciclo>/<curso>/archivos/
   BASE_DIR/<ciclo>/<curso>/youtube.html   (enlaces de YouTube por semana, no se descargan)
 """
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
+import requests.adapters
 
-from scrape import (
-    obtener_token, obtener_cursos, obtener_contenido,
-    materiales_descargables, enlaces_youtube, escribir_indice_youtube,
-    resolver_ciclo, sanitizar,
-)
+from scrape import escribir_indice_youtube, sanitizar
 
 
-def _descargar_archivo(url: str, destino: Path, log=print) -> bool:
-    # se baja a .part y se renombra al final: un corte a medias no deja un archivo "completo" falso
+def _descargar_archivo(http: requests.Session, url: str, destino: Path) -> str | None:
+    """Baja a .part y renombra al final: un corte a medias no deja un archivo "completo" falso.
+    Devuelve None si salió bien, o el mensaje de error."""
     parcial = destino.with_name(destino.name + ".part")
     try:
-        with requests.get(url, stream=True, timeout=300) as res:
+        with http.get(url, stream=True, timeout=300) as res:
             res.raise_for_status()
             destino.parent.mkdir(parents=True, exist_ok=True)
             with open(parcial, "wb") as f:
                 for chunk in res.iter_content(1024 * 1024):
                     f.write(chunk)
         parcial.replace(destino)
-        return True
-    except Exception as e:
+        return None
+    except (requests.RequestException, OSError) as e:
         parcial.unlink(missing_ok=True)
-        log("WARN", "#f59e0b", f"{destino.name}: {e}")
-        return False
+        return str(e)
 
 
 def descargar_materiales(
-    sesion_dir: str, base_dir: str,
+    base_dir: str, cursos: list[dict], workers: int = 4,
     log=print, progreso=lambda actual, total: None,
-    nombres: list[str] | None = None,
 ) -> dict:
     base = Path(base_dir).expanduser()
 
-    _, student_id, headers = obtener_token(sesion_dir, log=log)
+    pendientes = []
+    for curso in cursos:
+        carpeta = base / curso["periodo"] / sanitizar(curso["nombre"])
+        if escribir_indice_youtube(carpeta, curso["nombre"], curso.get("youtube") or []):
+            log("INFO", "gray", f"{curso['nombre']}: youtube.html con {len(curso['youtube'])} video(s)")
+        for m in curso["materiales"]:
+            destino = carpeta / "archivos" / m["archivo"]
+            if not destino.exists():
+                pendientes.append((curso["nombre"], m["url"], destino))
 
-    log("INFO", "gray", "Consultando cursos...")
-    cursos = obtener_cursos(student_id, headers)
-    if nombres:
-        cursos = [c for c in cursos if c["nombre"] in nombres]
-    total = len(cursos)
-    log("SUCCESS", "#22c55e", f"{len(cursos)} curso(s) a procesar")
+    total = len(pendientes)
+    log("SUCCESS", "#22c55e", f"{total} archivo(s) por bajar de {len(cursos)} curso(s)")
 
-    ok = 0
-    fail = 0
-    for i, curso in enumerate(cursos, start=1):
-        ciclo = resolver_ciclo(curso["periodo"])
-        carpeta = base / ciclo / sanitizar(curso["nombre"]) / "archivos"
-
-        items = obtener_contenido(curso["courseId"], curso["sectionId"], headers)
-        enlaces = enlaces_youtube(items)
-        if escribir_indice_youtube(carpeta.parent, curso["nombre"], enlaces):
-            log("INFO", "gray", f"{curso['nombre']}: youtube.html con {len(enlaces)} video(s)")
-        nuevos = 0
-        for material in materiales_descargables(items):
-            nombre_archivo = material["archivo"]
-            destino = carpeta / nombre_archivo
-            if destino.exists():
-                continue
-
-            if _descargar_archivo(material["url"], destino, log=log):
+    http = requests.Session()
+    http.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=workers * 2))
+    ok = fail = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futuros = {pool.submit(_descargar_archivo, http, url, destino): (nombre, destino)
+                   for nombre, url, destino in pendientes}
+        for i, fut in enumerate(as_completed(futuros), start=1):
+            nombre, destino = futuros[fut]
+            error = fut.result()
+            if error is None:
                 ok += 1
-                nuevos += 1
-                log("SUCCESS", "#22c55e", f"{curso['nombre']} — {nombre_archivo}")
+                log("SUCCESS", "#22c55e", f"{nombre} — {destino.name}")
             else:
                 fail += 1
-
-        if nuevos:
-            log("INFO", "gray", f"{curso['nombre']}: {nuevos} archivo(s) nuevo(s)")
-        progreso(i, total)
+                log("WARN", "#f59e0b", f"{destino.name}: {error}")
+            progreso(i, total)
 
     log("SUCCESS", "#22c55e", f"Descarga de materiales completa — {ok} nuevos, {fail} fallidos")
     return {"ok": ok, "fail": fail}

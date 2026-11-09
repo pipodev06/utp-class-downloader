@@ -1,7 +1,6 @@
 """
-Descarga real de grabaciones Zoom — flujo independiente del listado.
-Hace su propio login + recorrido de cursos, exporta la sesión de Playwright
-y descarga cada grabación en paralelo (headless) a:
+Descarga real de grabaciones Zoom a partir de lo que ya listó scrape.listar_todo.
+Exporta la sesión de Playwright y descarga cada grabación en paralelo (headless) a:
   BASE_DIR/<ciclo>/<curso>/videos/
 Portado de zoom_download.py del proyecto original.
 """
@@ -10,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from playwright.sync_api import sync_playwright
 
-from scrape import obtener_token, obtener_cursos, obtener_zoom, grabaciones, resolver_ciclo, sanitizar
+from scrape import sanitizar, sesion_api
 
 ERRORES_ZOOM = [
     "esta grabación no existe", "this recording does not exist",
@@ -127,35 +126,35 @@ def _descargar_uno(rec: dict, storage_state: dict, base_dir: Path) -> tuple[bool
 
 
 def descargar_zoom(
-    sesion_dir: str, base_dir: str, workers: int = 4,
+    sesion_dir: str, base_dir: str, cursos: list[dict], workers: int = 4,
     log=print, progreso=lambda actual, total: None,
-    nombres: list[str] | None = None,
 ) -> dict:
+    """Descarga las grabaciones de 'cursos' (entradas de scrape.listar_todo, sin re-consultar la API).
+    Solo lanza navegador para las que faltan: las ya bajadas o marcadas .skip se saltan antes."""
     base = Path(base_dir).expanduser()
 
-    _, student_id, headers = obtener_token(sesion_dir, log=log)
-
-    log("INFO", "gray", "Consultando grabaciones Zoom...")
-    cursos = obtener_cursos(student_id, headers)
-    if nombres:
-        cursos = [c for c in cursos if c["nombre"] in nombres]
-
     pendientes = []
+    ya = 0
     for curso in cursos:
-        ciclo = resolver_ciclo(curso["periodo"])
-        for g in grabaciones(obtener_zoom(curso["courseId"], curso["sectionId"], headers)):
+        carpeta = base / curso["periodo"] / sanitizar(curso["nombre"]) / "videos"
+        for g in curso["videos"]:
+            if (carpeta / f"{g['archivo']}.mp4").exists() or (carpeta / f"{g['archivo']}.skip").exists():
+                ya += 1
+                continue
             pendientes.append({
                 "titulo": g["titulo"],
                 "archivo": g["archivo"],
                 "curso": curso["nombre"],
-                "periodo": ciclo,
+                "periodo": curso["periodo"],
                 "grabacion": g["url"],
             })
 
     total = len(pendientes)
-    log("SUCCESS", "#22c55e", f"{total} grabaciones encontradas")
+    log("SUCCESS", "#22c55e", f"{total} grabaciones por bajar ({ya} ya descargadas o no disponibles)")
     if not pendientes:
         return {"ok": 0, "fail": 0}
+
+    sesion_api(sesion_dir, log=log)   # asegura sesión UTP vigente (login solo si el token venció)
 
     log("INFO", "gray", "Exportando sesión...")
     storage = exportar_sesion(sesion_dir)

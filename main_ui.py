@@ -52,6 +52,7 @@ TEXT_MAIN = "#e5e7eb"
 # config local (carpeta y nº de descargas en paralelo). La contraseña NUNCA se guarda aquí:
 # usuario/clave vienen del .env (UTP_USER/UTP_PASS, que carga auth.py) o se escriben en ⚙.
 CONFIG_PATH = Path(__file__).parent / "config.json"
+CACHE_PATH = Path(__file__).parent / "cache" / "listado.json"   # último listado (se muestra al abrir)
 CONFIG_GUARDABLE = ("base_dir", "zoom_workers")
 
 
@@ -115,6 +116,7 @@ ESTADOS_TAREA = {   # metadata.status del portal → (etiqueta, color)
 ORDEN_ESTADO = {"NOT_DELIVERED": 0, "SCHEDULED": 1, "OUT_OF_DATE": 2, "DELIVERED": 3}
 FILTROS_TAREA = {   # texto del combo → estados que muestra (None = todos)
     "Pendientes": {"NOT_DELIVERED"},
+    "Nuevas": "NUEVAS",   # aparecidas en los últimos días (scrape.es_nueva)
     "Próximas": {"NOT_DELIVERED", "SCHEDULED"},
     "Vencidas sin entregar": {"OUT_OF_DATE"},
     "Entregadas": {"DELIVERED"},
@@ -136,6 +138,14 @@ def _fecha(texto: str) -> datetime:
         return datetime.strptime(texto[:19], "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return datetime.max
+
+
+def _fecha_corta(iso: str) -> str:
+    """'2026-11-09T17:24' → '09/11 17:24'."""
+    try:
+        return datetime.fromisoformat(iso).strftime("%d/%m %H:%M")
+    except ValueError:
+        return iso
 
 
 def _tiempo_restante(vence: datetime, ahora: datetime) -> str:
@@ -420,110 +430,36 @@ class ChromiumWorker(QThread):
             self.terminado.emit(False)
 
 
-class ScraperWorker(QThread):
+class Trabajo(QThread):
+    """Corre en segundo plano cualquier flujo (listar, materiales, Zoom) sin congelar la UI.
+    fn(log, progreso, curso_listo) -> resultado. 'terminado' emite el resultado, o None si falló."""
     log = Signal(str, str, str)   # nivel, color, mensaje
     progreso = Signal(int, int)   # actual, total
-    curso = Signal(dict)          # {nombre, periodo, materiales, videos} — uno a uno
-    terminado = Signal(bool)      # éxito
+    curso = Signal(dict)          # una entrada de curso apenas está lista (solo el listado)
+    terminado = Signal(object)
 
-    def __init__(self, utp_user: str, utp_pass: str):
+    def __init__(self, fn, utp_user: str = "", utp_pass: str = ""):
         super().__init__()
+        self.fn = fn
         self.utp_user = utp_user
         self.utp_pass = utp_pass
 
     def run(self):
-        if not self.utp_user or not self.utp_pass:
-            self.log.emit("WARN", ORANGE, "Falta UTP USER/UTP PASS — configúralos en ⚙")
-            self.terminado.emit(False)
-            return
-
-        # auth.py lee credenciales de módulo — se las inyectamos desde la config de la UI
-        auth.UTP_USER = self.utp_user
-        auth.UTP_PASS = self.utp_pass
-
+        # auth.py lee credenciales de módulo; solo hacen falta si el token guardado venció
+        if self.utp_user and self.utp_pass:
+            auth.UTP_USER = self.utp_user
+            auth.UTP_PASS = self.utp_pass
         try:
-            self.log.emit("INFO", "gray", "Abriendo navegador...")
-            emitir_log = lambda nivel, color, msg: self.log.emit(nivel, color, msg)
-            emitir_progreso = lambda actual, total: self.progreso.emit(actual, total)
-            emitir_curso = lambda curso: self.curso.emit(curso)
-            scrape.listar_todo(
-                SESION_DIR, log=emitir_log,
-                progreso=emitir_progreso, curso_listo=emitir_curso,
+            resultado = self.fn(
+                lambda n, c, m: self.log.emit(n, c, m),
+                lambda a, t: self.progreso.emit(a, t),
+                lambda curso: self.curso.emit(curso),
             )
-            self.terminado.emit(True)
+            self.terminado.emit(resultado)
         except Exception as e:
+            logger.exception("Falló un trabajo en segundo plano")
             self.log.emit("WARN", ORANGE, f"Error: {e}")
-            self.terminado.emit(False)
-
-
-class MaterialesWorker(QThread):
-    log = Signal(str, str, str)
-    progreso = Signal(int, int)
-    terminado = Signal(dict)   # {"ok": int, "fail": int}
-
-    def __init__(self, utp_user: str, utp_pass: str, base_dir: str, nombres: list[str] | None = None):
-        super().__init__()
-        self.utp_user = utp_user
-        self.utp_pass = utp_pass
-        self.base_dir = base_dir
-        self.nombres = nombres
-
-    def run(self):
-        if not self.utp_user or not self.utp_pass:
-            self.log.emit("WARN", ORANGE, "Falta UTP USER/UTP PASS — configúralos en ⚙")
-            self.terminado.emit({"ok": 0, "fail": 0})
-            return
-
-        auth.UTP_USER = self.utp_user
-        auth.UTP_PASS = self.utp_pass
-
-        try:
-            resumen = descargar_materiales.descargar_materiales(
-                SESION_DIR, self.base_dir,
-                log=lambda n, c, m: self.log.emit(n, c, m),
-                progreso=lambda a, t: self.progreso.emit(a, t),
-                nombres=self.nombres,
-            )
-            self.terminado.emit(resumen)
-        except Exception as e:
-            self.log.emit("WARN", ORANGE, f"Error: {e}")
-            self.terminado.emit({"ok": 0, "fail": 0})
-
-
-class ZoomWorker(QThread):
-    log = Signal(str, str, str)
-    progreso = Signal(int, int)
-    terminado = Signal(dict)   # {"ok": int, "fail": int}
-
-    def __init__(self, utp_user: str, utp_pass: str, base_dir: str, workers: int,
-                 nombres: list[str] | None = None):
-        super().__init__()
-        self.utp_user = utp_user
-        self.utp_pass = utp_pass
-        self.base_dir = base_dir
-        self.workers = workers
-        self.nombres = nombres
-
-    def run(self):
-        if not self.utp_user or not self.utp_pass:
-            self.log.emit("WARN", ORANGE, "Falta UTP USER/UTP PASS — configúralos en ⚙")
-            self.terminado.emit({"ok": 0, "fail": 0})
-            return
-
-        auth.UTP_USER = self.utp_user
-        auth.UTP_PASS = self.utp_pass
-
-        try:
-            resumen = descargar_zoom.descargar_zoom(
-                SESION_DIR, self.base_dir, workers=self.workers,
-                log=lambda n, c, m: self.log.emit(n, c, m),
-                progreso=lambda a, t: self.progreso.emit(a, t),
-                nombres=self.nombres,
-            )
-            self.terminado.emit(resumen)
-        except Exception as e:
-            self.log.emit("WARN", ORANGE, f"Error: {e}")
-            self.terminado.emit({"ok": 0, "fail": 0})
+            self.terminado.emit(None)
 
 
 class LogsWindow(QDialog):
@@ -642,9 +578,9 @@ class ConfiguracionDialog(QDialog):
         self.resumen_carpeta.setProperty("muted", "true")
         form.addRow("", self.resumen_carpeta)
         self._actualizar_resumen_carpeta()
-        hint = QLabel("1-8, default 4")
+        hint = QLabel("1-8 a la vez, para materiales y clases (default 4)")
         hint.setProperty("muted", "true")
-        form.addRow("ZOOM WORKERS", fila_zoom)
+        form.addRow("EN PARALELO", fila_zoom)
         form.addRow("", hint)
 
         layout.addLayout(form)
@@ -803,7 +739,14 @@ class VentanaPrincipal(QMainWindow):
         self._sel_videos = set()
         self._modo_seleccion = False
         self._cola_seleccionados = []
+        self._fecha_listado = ""      # ISO del último listado mostrado (caché o recién hecho)
+        self._unidad_progreso = "cursos"
 
+        # lo último que se listó aparece al instante; el refresco llega en segundo plano
+        cache = scrape.cargar_cache(CACHE_PATH)
+        if cache:
+            self._fecha_listado, cursos = cache
+            self._mostrar_cursos(cursos)
         self._preparar_chromium()
 
     # ───────────────────────── construcción de paneles ─────────────────────────
@@ -901,7 +844,8 @@ class VentanaPrincipal(QMainWindow):
 
     def _preparar_chromium(self):
         self.btn_iniciar.setEnabled(False)
-        self.label_estado.setText("Preparando Chromium...")
+        if not self._todos_cursos:
+            self.label_estado.setText("Preparando Chromium...")
         self.chromium_worker = ChromiumWorker()
         self.chromium_worker.log.connect(self._log)
         self.chromium_worker.terminado.connect(self._chromium_listo)
@@ -909,7 +853,12 @@ class VentanaPrincipal(QMainWindow):
 
     def _chromium_listo(self, exito: bool):
         self.btn_iniciar.setEnabled(True)
-        self.label_estado.setText("" if exito else "Chromium no disponible — revisa los logs")
+        if not exito:
+            self.label_estado.setText("Chromium no disponible — revisa los logs")
+        elif self._todos_cursos and scrape.token_vigente(SESION_DIR):
+            self.iniciar()   # refresco automático: con token vigente no abre ninguna ventana
+        elif not self._todos_cursos:
+            self.label_estado.setText("")
 
     def _abrir_logs(self):
         self.logs_window.show()
@@ -934,8 +883,8 @@ class VentanaPrincipal(QMainWindow):
         for widget in self._widgets_fila:
             widget.setEnabled(not ocupado)
 
-    def iniciar(self):
-        self.logs_window.texto.clear()
+    def _reiniciar_vista(self):
+        """Deja tablas, filtros y selección vacíos (antes de pintar un listado)."""
         self.arbol.clear()
         self.arbol_tareas.clear()
         self._todos_cursos = []
@@ -947,24 +896,57 @@ class VentanaPrincipal(QMainWindow):
         self.btn_seleccionar.blockSignals(False)
         self._modo_seleccion = False
         self.btn_descargar_seleccionados.setVisible(False)
-        self.btn_descargar_materiales.setVisible(False)
-        self.btn_descargar_zoom.setVisible(False)
         for combo in (self.filtro_periodo, self.filtro_periodo_tarea):
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("Todos")
             combo.blockSignals(False)
-        self.tabs.setTabText(1, "Tareas")
-        self.label_resumen_tareas.setText("Cargando...")
-        self.label_estado.setText("Iniciando...")
-        self._set_ocupado(True)
 
-        self.worker = ScraperWorker(self.config["utp_user"], self.config["utp_pass"])
+    def _mostrar_cursos(self, cursos: list[dict]):
+        """Pinta un listado completo (de la caché o recién traído) y recalcula disco y tareas."""
+        periodo_tareas = self.filtro_periodo_tarea.currentText()
+        self._reiniciar_vista()
+        for c in cursos:
+            self._agregar_curso(c)
+        for combo in (self.filtro_periodo, self.filtro_periodo_tarea):
+            ordenar_periodos(combo)
+        # en Tareas lo útil es el ciclo en curso: el periodo más reciente (o el que ya estaba)
+        if self.filtro_periodo_tarea.findText(periodo_tareas) > 0:
+            self.filtro_periodo_tarea.setCurrentText(periodo_tareas)
+        elif self.filtro_periodo_tarea.count() > 1:
+            self.filtro_periodo_tarea.setCurrentIndex(1)
+        self.btn_descargar_materiales.setVisible(bool(self._todos_cursos))
+        self.btn_descargar_zoom.setVisible(bool(self._todos_cursos))
+        self._pintar_tareas()
+        self.detectar_descargas()
+
+    def _lanzar(self, fn, al_terminar, unidad: str, con_credenciales: bool = False, en_vivo=None):
+        """Arranca un Trabajo en segundo plano con log y progreso conectados."""
+        self._unidad_progreso = unidad
+        self._set_ocupado(True)
+        cred = (self.config["utp_user"], self.config["utp_pass"]) if con_credenciales else ()
+        self.worker = Trabajo(fn, *cred)
         self.worker.log.connect(self._log)
         self.worker.progreso.connect(self._actualizar_progreso)
-        self.worker.curso.connect(self._agregar_curso)
-        self.worker.terminado.connect(self._login_terminado)
+        if en_vivo:
+            self.worker.curso.connect(en_vivo)
+        self.worker.terminado.connect(al_terminar)
         self.worker.start()
+
+    def iniciar(self):
+        self.logs_window.texto.clear()
+        previos = list(self._todos_cursos)   # para detectar tareas nuevas y cubrir fallos de la API
+        self._previos = previos              # se restauran si el refresco falla
+        self._reiniciar_vista()
+        self.label_resumen_tareas.setText("Actualizando...")
+        self.label_estado.setText("Actualizando...")
+        self._lanzar(
+            lambda log, prog, curso: scrape.listar_todo(SESION_DIR, log, prog, curso, previos=previos),
+            self._login_terminado, "cursos", con_credenciales=True, en_vivo=self._agregar_curso,
+        )
+
+    def _cursos_para(self, nombres: list[str] | None) -> list[dict]:
+        return [c for c in self._todos_cursos if not nombres or c["nombre"] in nombres]
 
     def descargar_materiales(self, nombres: list[str] | None = None):
         self.logs_window.texto.clear()
@@ -972,16 +954,11 @@ class VentanaPrincipal(QMainWindow):
             f"Descargando materiales de {len(nombres)} curso(s)..." if nombres
             else "Descargando materiales de todos los cursos..."
         )
-        self._set_ocupado(True)
-
-        self.worker_materiales = MaterialesWorker(
-            self.config["utp_user"], self.config["utp_pass"], self.config["base_dir"],
-            nombres=nombres,
+        cursos, base_dir, paralelo = self._cursos_para(nombres), self.config["base_dir"], self.config["zoom_workers"]
+        self._lanzar(
+            lambda log, prog, _: descargar_materiales.descargar_materiales(base_dir, cursos, paralelo, log, prog),
+            self._descarga_terminada, "archivos",
         )
-        self.worker_materiales.log.connect(self._log)
-        self.worker_materiales.progreso.connect(self._actualizar_progreso)
-        self.worker_materiales.terminado.connect(self._descarga_terminada)
-        self.worker_materiales.start()
 
     def descargar_zoom_clases(self, nombres: list[str] | None = None):
         self.logs_window.texto.clear()
@@ -989,17 +966,11 @@ class VentanaPrincipal(QMainWindow):
             f"Descargando grabaciones de {len(nombres)} curso(s)..." if nombres
             else "Descargando grabaciones de todos los cursos..."
         )
-        self._set_ocupado(True)
-
-        self.worker_zoom = ZoomWorker(
-            self.config["utp_user"], self.config["utp_pass"],
-            self.config["base_dir"], self.config["zoom_workers"],
-            nombres=nombres,
+        cursos, base_dir, paralelo = self._cursos_para(nombres), self.config["base_dir"], self.config["zoom_workers"]
+        self._lanzar(
+            lambda log, prog, _: descargar_zoom.descargar_zoom(SESION_DIR, base_dir, cursos, paralelo, log, prog),
+            self._descarga_terminada, "clases", con_credenciales=True,
         )
-        self.worker_zoom.log.connect(self._log)
-        self.worker_zoom.progreso.connect(self._actualizar_progreso)
-        self.worker_zoom.terminado.connect(self._descarga_terminada)
-        self.worker_zoom.start()
 
     def _toggle_modo_seleccion(self, activo: bool):
         self._modo_seleccion = activo
@@ -1032,6 +1003,8 @@ class VentanaPrincipal(QMainWindow):
             partes.append(f"faltan {faltan_mat} materiales y {faltan_vid} clases")
         elif any("disco" in c for c in visibles):
             partes.append("todo descargado")
+        if self._fecha_listado:
+            partes.append(f"actualizado {_fecha_corta(self._fecha_listado)}")
         self.label_estado.setText(" · ".join(partes))
 
     # ───────────────────────── selección y descargas ─────────────────────────
@@ -1058,10 +1031,11 @@ class VentanaPrincipal(QMainWindow):
         else:
             self.descargar_zoom_clases(nombres=nombres)
 
-    def _descarga_terminada(self, resumen: dict):
+    def _descarga_terminada(self, resumen: dict | None):
         if self._cola_seleccionados:
             self._procesar_siguiente_seleccionado()
             return
+        resumen = resumen or {}
         self._set_ocupado(False)
         self.progreso_bar.setVisible(False)
         self._log("SUCCESS", GREEN, f"Descarga terminada — {resumen.get('ok', 0)} ok, {resumen.get('fail', 0)} fallidos")
@@ -1071,7 +1045,7 @@ class VentanaPrincipal(QMainWindow):
         self.progreso_bar.setVisible(True)
         self.progreso_bar.setMaximum(total)
         self.progreso_bar.setValue(actual)
-        self.label_estado.setText(f"Procesando {actual}/{total} cursos...")
+        self.label_estado.setText(f"Procesando {actual}/{total} {self._unidad_progreso}...")
 
     # ───────────────────────── tabla de cursos ─────────────────────────
 
@@ -1198,22 +1172,25 @@ class VentanaPrincipal(QMainWindow):
         if self._todos_cursos and not listando:
             self._actualizar_resumen_cursos()
 
-    def _login_terminado(self, exito: bool):
+    def _login_terminado(self, cursos: list[dict] | None):
         self._set_ocupado(False)
         self.progreso_bar.setVisible(False)
-        if not exito:
-            self.label_estado.setText("Falló — revisa los logs")
-            self.label_resumen_tareas.setText("Sin datos")
+        if cursos is None:
+            if self._previos:   # no perder lo que se veía: vuelve el último listado
+                self._mostrar_cursos(self._previos)
+                self.label_estado.setText(f"No se pudo actualizar — se muestra el listado de "
+                                          f"{_fecha_corta(self._fecha_listado)} · revisa los logs")
+            else:
+                self.label_estado.setText("Falló — revisa los logs")
+                self.label_resumen_tareas.setText("Sin datos")
             return
-        self.btn_descargar_materiales.setVisible(True)
-        self.btn_descargar_zoom.setVisible(True)
-        for combo in (self.filtro_periodo, self.filtro_periodo_tarea):
-            ordenar_periodos(combo)
-        # en Tareas lo útil es el ciclo en curso: el periodo más reciente
-        if self.filtro_periodo_tarea.count() > 1:
-            self.filtro_periodo_tarea.setCurrentIndex(1)
-        self._pintar_tareas()
-        self.detectar_descargas()
+        scrape.guardar_cache(CACHE_PATH, cursos)
+        self._fecha_listado = datetime.now().isoformat(timespec="minutes")
+        # se repinta desde el resultado final: trae 'visto' (tareas nuevas) que se calcula al terminar
+        self._mostrar_cursos(cursos)
+        nuevas = sum(scrape.es_nueva(t) for c in cursos for t in c["tareas"])
+        if nuevas:
+            self._log("SUCCESS", GREEN, f"{nuevas} tarea(s) nueva(s) desde el último listado")
 
     # ───────────────────────── tareas ─────────────────────────
 
@@ -1231,9 +1208,11 @@ class VentanaPrincipal(QMainWindow):
         ]
         pendientes = [t for t in tareas if t["estado"] == "NOT_DELIVERED"]
         urgentes = [t for t in pendientes if (_fecha(t["vence"]) - ahora).total_seconds() < 48 * 3600]
+        nuevas = [t for t in tareas if scrape.es_nueva(t)]
         self.tabs.setTabText(1, f"Tareas ({len(pendientes)})" if pendientes else "Tareas")
 
-        partes = [f"{len(pendientes)} pendientes"]
+        partes = [f"{len(nuevas)} nuevas"] if nuevas else []
+        partes.append(f"{len(pendientes)} pendientes")
         if urgentes:
             partes.append(f"{len(urgentes)} vencen en menos de 48 h")
         vencidas = sum(t["estado"] == "OUT_OF_DATE" for t in tareas)
@@ -1241,8 +1220,11 @@ class VentanaPrincipal(QMainWindow):
             partes.append(f"{vencidas} vencidas sin entregar")
         self.label_resumen_tareas.setText(" · ".join(partes))
 
-        visibles = [t for t in tareas if filtro is None or t["estado"] in filtro]
-        visibles.sort(key=lambda t: (ORDEN_ESTADO.get(t["estado"], 9), t["vence"]))
+        if filtro == "NUEVAS":
+            visibles = nuevas
+        else:
+            visibles = [t for t in tareas if filtro is None or t["estado"] in filtro]
+        visibles.sort(key=lambda t: (ORDEN_ESTADO.get(t["estado"], 9), not scrape.es_nueva(t), t["vence"]))
         for t in visibles:
             self._agregar_fila_tarea(t, ahora)
         if not visibles:
@@ -1269,6 +1251,10 @@ class VentanaPrincipal(QMainWindow):
         item.setForeground(4, QColor(TEXT_MUTED))
         item.setToolTip(3, t["titulo"])
         item.setToolTip(4, "★ = calificada" if t["calificada"] else "")
+        if scrape.es_nueva(t):   # nueva: título en azul con un rótulo, sin agregar columnas
+            item.setText(3, f"Nueva  ·  {titulo}")
+            item.setForeground(3, QColor(BLUE))
+            item.setToolTip(3, f"Apareció el {_fecha_corta(t['visto'])}\n{t['titulo']}")
         item.setData(0, Qt.ItemDataRole.UserRole, t["url"])
         self.arbol_tareas.addTopLevelItem(item)
 
