@@ -1,6 +1,7 @@
 import sys
 import json
 import logging
+import re
 import subprocess
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -72,6 +73,22 @@ def cargar_config() -> dict:
 def guardar_config(config: dict):
     datos = {k: config[k] for k in CONFIG_GUARDABLE}
     CONFIG_PATH.write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def resumir_carpeta(ruta: str) -> dict | None:
+    """Conteo rápido de una carpeta de descargas. None si no existe."""
+    base = Path(ruta).expanduser()
+    if not base.is_dir():
+        return None
+    periodos = sorted((p.name for p in base.iterdir() if p.is_dir() and re.match(r"^\d{4}-I{1,2}$", p.name)),
+                      reverse=True)
+    archivos = videos = 0
+    for p in periodos:
+        for f in (base / p).rglob("*"):
+            if f.is_file() and f.suffix not in (".skip", ".fail", ".part"):
+                archivos += 1
+                videos += f.suffix == ".mp4"
+    return {"periodos": periodos, "archivos": archivos, "videos": videos}
 
 
 def ordenar_periodos(combo: QComboBox):
@@ -621,6 +638,10 @@ class ConfiguracionDialog(QDialog):
         form.addRow("UTP USER", self.utp_user)
         form.addRow("UTP PASS", fila_pass)
         form.addRow("BASE DIR", fila_ruta)
+        self.resumen_carpeta = QLabel()
+        self.resumen_carpeta.setProperty("muted", "true")
+        form.addRow("", self.resumen_carpeta)
+        self._actualizar_resumen_carpeta()
         hint = QLabel("1-8, default 4")
         hint.setProperty("muted", "true")
         form.addRow("ZOOM WORKERS", fila_zoom)
@@ -644,6 +665,21 @@ class ConfiguracionDialog(QDialog):
         carpeta = QFileDialog.getExistingDirectory(self, "Elegir carpeta", self.base_dir.text())
         if carpeta:
             self.base_dir.setText(carpeta)
+            self._actualizar_resumen_carpeta()
+
+    def _actualizar_resumen_carpeta(self):
+        """Muestra qué hay en la carpeta elegida, para notar al tiro si es la equivocada."""
+        resumen = resumir_carpeta(self.base_dir.text())
+        if resumen is None:
+            texto, color = "La carpeta no existe", ORANGE
+        elif not resumen["periodos"]:
+            texto, color = "Sin descargas aquí (no hay carpetas de periodo como 2026-II)", ORANGE
+        else:
+            texto = (f"{resumen['archivos']} archivos · {resumen['videos']} videos · "
+                     f"periodos {', '.join(resumen['periodos'])}")
+            color = TEXT_MUTED
+        self.resumen_carpeta.setText(texto)
+        self.resumen_carpeta.setStyleSheet(f"color: {color};")
 
     def obtener_valores(self) -> dict:
         return {
