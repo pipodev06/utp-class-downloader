@@ -201,8 +201,16 @@ def _nombre_unico(base: str, usados: dict) -> str:
 # archivos enlazados DENTRO de las lecturas (contenido HTML): documentos y videos de la UTP.
 # mp3 (audios de Inglés) e imágenes (banners) se dejan fuera a propósito.
 EXT_INCRUSTADOS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".mp4", ".m4v"}
-_RE_ENLACE_HTML = re.compile(r'<(?:a|source|video|embed)\b[^>]*?(?:href|src)="(https?://[^"]+)"', re.I)
-_RE_YOUTUBE = re.compile(r'(?:href|src)="(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^"]+)"', re.I)
+# href/src con comillas dobles, simples o SIN comillas (el contenido migrado de Canvas trae
+# href=https://...pdf sin comillas y se perdía). Grupos: 1 = "...", 2 = '...', 3 = sin comillas.
+_VALOR_URL = r"""\s*=\s*(?:"(https?://[^"]+)"|'(https?://[^']+)'|(https?://[^\s"'<>]+))"""
+_RE_ENLACE_HTML = re.compile(r"<(?:a|source|video|embed)\b[^>]*?\b(?:href|src)" + _VALOR_URL, re.I)
+_RE_YOUTUBE_HTML = re.compile(r"\b(?:href|src)" + _VALOR_URL, re.I)
+_ES_YOUTUBE = re.compile(r"^https?://(?:www\.)?(?:youtube\.com|youtu\.be)/", re.I)
+
+
+def _urls(patron: re.Pattern, texto: str) -> list[str]:
+    return [next(g for g in grupos if g) for grupos in patron.findall(texto)]
 _RE_YOUTUBE_ID = re.compile(r"(?:embed/|watch\?v=|youtu\.be/|shorts/)([\w-]{11})")
 
 
@@ -225,7 +233,7 @@ def _incrustados(item: dict) -> list[tuple[str, str]]:
     """[(url, nombre_original)] de archivos útiles dentro de una lectura HTML o MULTIMEDIA."""
     meta = item.get("metadata") or {}
     urls = [f.get("url") or "" for f in meta.get("formats") or []]
-    urls += _RE_ENLACE_HTML.findall(meta.get("contentHtml") or "")
+    urls += _urls(_RE_ENLACE_HTML, meta.get("contentHtml") or "")
     resultado = []
     for url in urls:
         url = html.unescape(url)
@@ -284,7 +292,7 @@ def enlaces_youtube(items: list[dict]) -> list[dict]:
     for item in items:
         meta = item.get("metadata") or {}
         texto = (meta.get("contentHtml") or "") + f' href="{meta.get("url") or ""}"'
-        for url in _RE_YOUTUBE.findall(texto):
+        for url in (u for u in _urls(_RE_YOUTUBE_HTML, texto) if _ES_YOUTUBE.match(u)):
             m = _RE_YOUTUBE_ID.search(html.unescape(url))
             if not m or m.group(1) in vistos:
                 continue
