@@ -39,6 +39,8 @@ venv/bin/python main_ui.py
 6. Pestaña **Tareas**: tareas y evaluaciones del periodo con su estado (Pendiente, Entregada, Vencida, Programada), fecha límite, tiempo restante y botón **Abrir** que te lleva directo a la tarea en el portal. En rojo las pendientes que vencen en menos de 48 h; ★ = calificada.
 7. El botón **❯_** abre el log técnico; también queda guardado en `logs/app.log`.
 
+Los materiales incluyen también los PDF, Word, PowerPoint, Excel y videos de la UTP que vienen enlazados dentro de las lecturas de cada semana. Los videos de YouTube no se descargan: quedan en `youtube.html` dentro de la carpeta del curso, ordenados por semana.
+
 Las descargas son reanudables: la próxima corrida solo baja lo que falta — nunca vuelve a descargar un archivo que ya existe.
 
 > **Zoom borra las grabaciones a los pocos meses.** Descarga las clases del ciclo en curso antes de que terminen; las de ciclos viejos suelen salir como `.skip`.
@@ -52,8 +54,9 @@ BASE_DIR/
 │   │   ├── archivos/
 │   │   │   ├── S01_Introducción.pdf
 │   │   │   └── S02_Vectores.pptx
-│   │   └── videos/
-│   │       └── Semana 1 - Clase.mp4
+│   │   ├── videos/
+│   │   │   └── Semana 1 - Clase.mp4
+│   │   └── youtube.html
 │   └── ...
 └── 2025-II/
     └── ...

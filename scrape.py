@@ -3,9 +3,11 @@ Lógica de scraping (sin Qt) — login + listar cursos/materiales/videos.
 Reusa auth.py para el login; el resto está portado de scraper.py original.
 """
 import base64
+import html
 import json
 import re
 from pathlib import Path
+from urllib.parse import unquote
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -141,14 +143,53 @@ def _nombre_unico(base: str, usados: dict) -> str:
     return base if usados[base] == 1 else f"{base} ({usados[base]})"
 
 
+# archivos enlazados DENTRO de las lecturas (contenido HTML): documentos y videos de la UTP.
+# mp3 (audios de Inglés) e imágenes (banners) se dejan fuera a propósito.
+EXT_INCRUSTADOS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".mp4", ".m4v"}
+_RE_ENLACE_HTML = re.compile(r'<(?:a|source|video|embed)\b[^>]*?(?:href|src)="(https?://[^"]+)"', re.I)
+_RE_YOUTUBE = re.compile(r'(?:href|src)="(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/[^"]+)"', re.I)
+_RE_YOUTUBE_ID = re.compile(r"(?:embed/|watch\?v=|youtu\.be/|shorts/)([\w-]{11})")
+
+
+_RE_PREFIJO_EMOJI = re.compile(r"^[^\w(¿¡]+")       # '📺 Video...' → 'Video...'
+_RE_SUFIJO_S3 = re.compile(r"(?:_[A-Z0-9]{6})+$")    # 'Lectura_WGZAGL_ISVGIB' → 'Lectura'
+
+
+def limpiar_titulo(titulo: str) -> str:
+    """Quita emojis/símbolos del inicio ('📝', '🔴 ') que el portal pone en los títulos."""
+    return _RE_PREFIJO_EMOJI.sub("", titulo or "").strip()
+
+
+def _nombre_original(url: str) -> str:
+    """'.../Semana%2B01%2B-%2BLectura_WGZAGL.pdf' → 'Semana 01 - Lectura' (sin extensión)."""
+    base = unquote(unquote(url.split("?")[0].rsplit("/", 1)[-1])).replace("+", " ")
+    return _RE_SUFIJO_S3.sub("", Path(base).stem).strip()
+
+
+def _incrustados(item: dict) -> list[tuple[str, str]]:
+    """[(url, nombre_original)] de archivos útiles dentro de una lectura HTML o MULTIMEDIA."""
+    meta = item.get("metadata") or {}
+    urls = [f.get("url") or "" for f in meta.get("formats") or []]
+    urls += _RE_ENLACE_HTML.findall(meta.get("contentHtml") or "")
+    resultado = []
+    for url in urls:
+        url = html.unescape(url)
+        if "upload-file-storage" in url and Path(unquote(url.split("?")[0])).suffix.lower() in EXT_INCRUSTADOS:
+            resultado.append((url, _nombre_original(url)))
+    return resultado
+
+
 def materiales_descargables(items: list[dict]) -> list[dict]:
-    """Archivos descargables del curso: [{archivo, url}]. Única fuente del nombre en disco."""
+    """Archivos descargables del curso: [{archivo, url}]. Única fuente del nombre en disco.
+    Incluye los archivos sueltos (FILE) y los enlazados dentro de las lecturas; cada URL una sola vez."""
     resultado = []
     usados: dict = {}
+    vistos: set = set()
+    # 1ª pasada: archivos sueltos (nombres históricos, no deben cambiar)
     for item in items:
         tipo = (item.get("type") or "").upper()
         meta = item.get("metadata") or {}
-        if tipo in SKIP_TIPOS:
+        if tipo in SKIP_TIPOS or tipo == "MULTIMEDIA":
             continue
         url = (meta.get("url") or meta.get("videoUrl") or meta.get("fileUrl") or
                meta.get("src") or meta.get("link") or "")
@@ -158,10 +199,75 @@ def materiales_descargables(items: list[dict]) -> list[dict]:
         ext = Path(url.split("?")[0]).suffix.lower()
         if not es_s3 and ext not in EXT_OK:
             continue
+        if url in vistos:
+            continue
+        vistos.add(url)
         titulo = item.get("title") or item.get("name") or "archivo"
         base = sanitizar(f"S{item.get('_week') or 0:02d}_{titulo}")
         resultado.append({"archivo": _nombre_unico(base, usados) + (ext or ".bin"), "url": url})
+
+    # 2ª pasada: archivos enlazados dentro de las lecturas (si no salieron ya como sueltos)
+    for item in items:
+        if (item.get("type") or "").upper() not in ("HTML", "MULTIMEDIA"):
+            continue
+        titulo = limpiar_titulo(item.get("title")) or "lectura"
+        for url, original in _incrustados(item):
+            if url in vistos:
+                continue
+            vistos.add(url)
+            ext = Path(unquote(url.split("?")[0])).suffix.lower()
+            base = sanitizar(f"S{item.get('_week') or 0:02d}_{titulo} - {original}")
+            resultado.append({"archivo": _nombre_unico(base, usados) + ext, "url": url})
     return resultado
+
+
+def enlaces_youtube(items: list[dict]) -> list[dict]:
+    """Videos de YouTube citados en el curso (lecturas HTML y enlaces URL): [{semana, titulo, url}].
+    No se descargan (términos de YouTube): solo se guardan para abrirlos rápido."""
+    resultado = []
+    vistos: set = set()
+    for item in items:
+        meta = item.get("metadata") or {}
+        texto = (meta.get("contentHtml") or "") + f' href="{meta.get("url") or ""}"'
+        for url in _RE_YOUTUBE.findall(texto):
+            m = _RE_YOUTUBE_ID.search(html.unescape(url))
+            if not m or m.group(1) in vistos:
+                continue
+            vistos.add(m.group(1))
+            resultado.append({
+                "semana": item.get("_week") or 0,
+                "titulo": (item.get("title") or "").strip(),
+                "url": f"https://www.youtube.com/watch?v={m.group(1)}",
+            })
+    return resultado
+
+
+def escribir_indice_youtube(carpeta: Path, nombre_curso: str, enlaces: list[dict]) -> bool:
+    """Guarda <curso>/youtube.html con los enlaces agrupados por semana (doble clic → navegador).
+    Devuelve True si el archivo cambió."""
+    if not enlaces:
+        return False
+    filas = []
+    semana_actual = None
+    for e in sorted(enlaces, key=lambda e: e["semana"]):
+        if e["semana"] != semana_actual:
+            semana_actual = e["semana"]
+            filas.append(f"<h2>{'Semana ' + str(semana_actual) if semana_actual else 'General'}</h2>")
+        filas.append(f'<p><a href="{e["url"]}" target="_blank">{html.escape(e["titulo"] or e["url"])}</a></p>')
+    contenido = (
+        '<!doctype html><meta charset="utf-8">'
+        f"<title>YouTube — {html.escape(nombre_curso)}</title>"
+        "<style>body{font:15px Segoe UI,sans-serif;max-width:760px;margin:32px auto;padding:0 16px;"
+        "background:#0e1013;color:#e5e7eb}h1{font-size:20px}h2{font-size:15px;color:#9aa1ac;"
+        "margin-top:24px}a{color:#3b82f6;text-decoration:none}a:hover{text-decoration:underline}</style>"
+        f"<h1>{html.escape(nombre_curso)} — videos de YouTube</h1>" + "".join(filas)
+    )
+    destino = carpeta / "youtube.html"
+    if destino.exists() and destino.read_text(encoding="utf-8") == contenido:
+        return False
+    carpeta.mkdir(parents=True, exist_ok=True)
+    destino.write_text(contenido, encoding="utf-8")
+    return True
 
 
 def grabaciones(zoom: list[dict]) -> list[dict]:

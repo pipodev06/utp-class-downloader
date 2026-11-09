@@ -1,7 +1,6 @@
 import sys
 import json
 import logging
-import re
 import subprocess
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -104,7 +103,6 @@ FILTROS_TAREA = {   # texto del combo → estados que muestra (None = todos)
     "Entregadas": {"DELIVERED"},
     "Todas": None,
 }
-RE_PREFIJO_EMOJI = re.compile(r"^[^\w(¿¡]+")   # quita '📝', '🔴 ' etc. del inicio del título
 
 
 def estilo_flecha_combo() -> str:
@@ -1226,7 +1224,7 @@ class VentanaPrincipal(QMainWindow):
         if t["estado"] in ("NOT_DELIVERED", "SCHEDULED"):
             texto_vence += f"  ·  {_tiempo_restante(vence, ahora)}"
 
-        titulo = RE_PREFIJO_EMOJI.sub("", t["titulo"])
+        titulo = scrape.limpiar_titulo(t["titulo"])
         tipo = t["tipo"] + (" ★" if t["calificada"] else "")
         item = QTreeWidgetItem([f"●  {etiqueta}", texto_vence, t["curso"], titulo, tipo, ""])
         item.setForeground(0, QColor(color))
