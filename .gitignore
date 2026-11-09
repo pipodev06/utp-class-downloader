@@ -1,5 +1,7 @@
 # credenciales — nunca subir
 .env
+.env.*
+!.env.example
 
 # sesión Playwright — contiene cookies de autenticación
 sesion/
@@ -25,3 +27,9 @@ dist/
 
 # logs de la app
 logs/
+
+# config local de la app (carpeta, descargas en paralelo)
+config.json
+
+# salida de scripts/check-*
+.check/

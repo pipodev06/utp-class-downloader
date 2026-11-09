@@ -1,0 +1,6 @@
+# Reglas mínimas del proyecto (sin esto ruff hereda la config global, mucho más estricta)
+line-length = 120
+
+[lint]
+select = ["F", "E9", "B"]
+ignore = ["B904"]

@@ -24,7 +24,7 @@ _PERIODO_ROMANO = {"2": "I", "3": "II"}
 def resolver_ciclo(periodo: str) -> str:
     m = _RE_PERIODO.match(periodo or "")
     if not m:
-        return periodo or "sin_ciclo"
+        return "Otros" if periodo == "9999" else (periodo or "sin_ciclo")
     anio = 2020 + int(m.group(1))
     return f"{anio}-{_PERIODO_ROMANO[m.group(2)]}"
 
@@ -117,7 +117,7 @@ def obtener_contenido(course_id: str, section_id: str, headers: dict) -> list[di
     items = []
     for unity in (resp.get("data") or {}).get("unities", []):
         for theme in unity.get("themes", []):
-            week = theme.get("weekNumber", 0)
+            week = theme.get("weekNumber") or 0
             for content in theme.get("contents", []):
                 content["_week"] = week
                 items.append(content)
@@ -134,8 +134,17 @@ def obtener_zoom(course_id: str, section_id: str, headers: dict) -> list[dict]:
     return (resp.get("data") or {}).get("listVideoConferenceResponse", [])
 
 
-def contar_materiales(items: list[dict]) -> int:
-    total = 0
+def _nombre_unico(base: str, usados: dict) -> str:
+    """Si el nombre ya salió en este curso, agrega ' (2)', ' (3)'...
+    La primera aparición conserva el nombre de siempre, así no se re-descarga lo que ya existe."""
+    usados[base] = usados.get(base, 0) + 1
+    return base if usados[base] == 1 else f"{base} ({usados[base]})"
+
+
+def materiales_descargables(items: list[dict]) -> list[dict]:
+    """Archivos descargables del curso: [{archivo, url}]. Única fuente del nombre en disco."""
+    resultado = []
+    usados: dict = {}
     for item in items:
         tipo = (item.get("type") or "").upper()
         meta = item.get("metadata") or {}
@@ -149,8 +158,58 @@ def contar_materiales(items: list[dict]) -> int:
         ext = Path(url.split("?")[0]).suffix.lower()
         if not es_s3 and ext not in EXT_OK:
             continue
-        total += 1
-    return total
+        titulo = item.get("title") or item.get("name") or "archivo"
+        base = sanitizar(f"S{item.get('_week') or 0:02d}_{titulo}")
+        resultado.append({"archivo": _nombre_unico(base, usados) + (ext or ".bin"), "url": url})
+    return resultado
+
+
+def grabaciones(zoom: list[dict]) -> list[dict]:
+    """Grabaciones con URL: [{titulo, archivo (sin extensión), url}].
+    Varias clases comparten título (ej. 'CURSO - 19591'), por eso el nombre se desambigua."""
+    resultado = []
+    usados: dict = {}
+    for clase in zoom:
+        url = clase.get("playUrl") or ""
+        if not url:
+            continue
+        titulo = clase.get("title") or "sin_titulo"
+        resultado.append({
+            "titulo": titulo,
+            "archivo": _nombre_unico(sanitizar(titulo), usados),
+            "url": url,
+        })
+    return resultado
+
+
+TIPOS_TAREA = {"HOMEWORK": "Tarea", "EVALUATION": "Evaluación", "FORUM": "Foro"}
+
+
+def extraer_tareas(items: list[dict], curso: dict) -> list[dict]:
+    """Tareas y evaluaciones del curso con su estado de entrega y enlace directo.
+    Los foros solo entran si son calificados (los de consultas no cuentan)."""
+    tareas = []
+    for item in items:
+        tipo = (item.get("type") or "").upper()
+        meta = item.get("metadata") or {}
+        if tipo not in TIPOS_TAREA or (tipo == "FORUM" and not meta.get("isQualified")):
+            continue
+        semana = item.get("_week") or 0
+        tareas.append({
+            "curso": curso["nombre"],
+            "tipo": TIPOS_TAREA[tipo],
+            "titulo": (item.get("title") or "").strip(),
+            "estado": meta.get("status") or "",   # DELIVERED / NOT_DELIVERED / OUT_OF_DATE / SCHEDULED
+            "calificada": bool(meta.get("isQualified")),
+            "desde": item.get("visibleFrom") or "",
+            "vence": item.get("visibleTo") or "",
+            "url": (
+                f"{BASE_URL}/student/courses/{curso['courseId']}/section/{curso['sectionId']}"
+                f"/learnv2/week/{semana}/unit/{curso['sectionId']}/theme/{item.get('themeId')}"
+                f"/content/{item.get('contentId')}/{tipo.lower()}/{item.get('contentId')}"
+            ),
+        })
+    return tareas
 
 
 def listar_todo(
@@ -158,7 +217,8 @@ def listar_todo(
     progreso=lambda actual, total: None,
     curso_listo=lambda curso: None,
 ) -> list[dict]:
-    """Login + token + recorre todos los cursos. Retorna [{nombre, periodo, materiales, videos}].
+    """Login + token + recorre todos los cursos. Retorna una entrada por curso con los
+    nombres de archivo esperados (para comparar con el disco) y sus tareas.
     Llama curso_listo(curso) apenas cada uno termina, para poder pintarlo en vivo."""
     _, student_id, headers = obtener_token(sesion_dir, log=log)
 
@@ -170,28 +230,32 @@ def listar_todo(
     resultado = []
     for i, curso in enumerate(cursos, start=1):
         items = obtener_contenido(curso["courseId"], curso["sectionId"], headers)
-        materiales = contar_materiales(items)
-        zoom = obtener_zoom(curso["courseId"], curso["sectionId"], headers)
-        videos = len([z for z in zoom if z.get("playUrl")])
+        materiales = [m["archivo"] for m in materiales_descargables(items)]
+        videos = [g["archivo"] for g in grabaciones(obtener_zoom(curso["courseId"], curso["sectionId"], headers))]
+        tareas = extraer_tareas(items, curso)
         entrada = {
             "nombre": curso["nombre"], "periodo": resolver_ciclo(curso["periodo"]),
-            "materiales": materiales, "videos": videos,
+            "materiales": materiales, "videos": videos, "tareas": tareas,
         }
         resultado.append(entrada)
-        log("INFO", "gray", f"{curso['nombre']}: {materiales} materiales, {videos} videos")
+        log("INFO", "gray", f"{curso['nombre']}: {len(materiales)} materiales, {len(videos)} videos, {len(tareas)} tareas")
         progreso(i, total)
         curso_listo(entrada)
 
     return resultado
 
 
-def contar_archivos_locales(base_dir: str, ciclo: str, nombre_curso: str) -> dict:
-    """Revisa si ya existen archivos/videos descargados en disco para este curso."""
-    carpeta = Path(base_dir).expanduser() / ciclo / sanitizar(nombre_curso)
+def estado_en_disco(base_dir: str, curso: dict) -> dict:
+    """Compara archivo por archivo lo esperado del curso con lo que hay en disco.
+    'videos_no_disp' = grabaciones marcadas .skip (Zoom ya las borró)."""
+    carpeta = Path(base_dir).expanduser() / curso["periodo"] / sanitizar(curso["nombre"])
     archivos_dir = carpeta / "archivos"
     videos_dir = carpeta / "videos"
-
-    n_archivos = len([f for f in archivos_dir.glob("*") if f.is_file()]) if archivos_dir.exists() else 0
-    n_videos = len(list(videos_dir.glob("*.mp4"))) if videos_dir.exists() else 0
-
-    return {"archivos_locales": n_archivos, "videos_locales": n_videos}
+    return {
+        "materiales_ok": sum((archivos_dir / a).exists() for a in curso["materiales"]),
+        "videos_ok": sum((videos_dir / f"{v}.mp4").exists() for v in curso["videos"]),
+        "videos_no_disp": sum(
+            (videos_dir / f"{v}.skip").exists() and not (videos_dir / f"{v}.mp4").exists()
+            for v in curso["videos"]
+        ),
+    }

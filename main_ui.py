@@ -1,6 +1,9 @@
 import sys
+import json
 import logging
+import re
 import subprocess
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -12,10 +15,10 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QDialog, QFormLayout, QSpinBox,
     QFileDialog, QTextEdit, QFrame, QMessageBox, QSpacerItem, QSizePolicy,
-    QTreeWidget, QTreeWidgetItem, QComboBox, QCheckBox, QProgressBar,
+    QTreeWidget, QTreeWidgetItem, QComboBox, QCheckBox, QProgressBar, QTabWidget,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl
+from PySide6.QtGui import QFont, QColor, QDesktopServices
 import qtawesome as qta
 
 import auth
@@ -34,16 +37,104 @@ logger = logging.getLogger("utp")
 logger.setLevel(logging.INFO)
 logger.addHandler(_handler)
 sys.excepthook = lambda tipo, valor, tb: logger.critical("Excepción no capturada", exc_info=(tipo, valor, tb))
-BASE_URL = "https://class.utp.edu.pe"
 
+# paleta (congelada en AGENTS.md)
 DARK_BG = "#0e1013"
 PANEL_BG = "#15181d"
 BORDER = "#262a31"
 BLUE = "#3b82f6"
 GREEN = "#22c55e"
 ORANGE = "#f59e0b"
+RED = "#ef4444"
 TEXT_MUTED = "#9aa1ac"
 TEXT_MAIN = "#e5e7eb"
+
+# config local (carpeta y nº de descargas en paralelo). La contraseña NUNCA se guarda aquí:
+# usuario/clave vienen del .env (UTP_USER/UTP_PASS, que carga auth.py) o se escriben en ⚙.
+CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_GUARDABLE = ("base_dir", "zoom_workers")
+
+
+def cargar_config() -> dict:
+    config = {
+        "utp_user": auth.UTP_USER or "",
+        "utp_pass": auth.UTP_PASS or "",
+        "base_dir": str(Path.home() / "Documents" / "utp-class-downloader"),
+        "zoom_workers": 4,
+    }
+    try:
+        guardado = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config.update({k: guardado[k] for k in CONFIG_GUARDABLE if k in guardado})
+    except (OSError, ValueError):
+        pass
+    return config
+
+
+def guardar_config(config: dict):
+    datos = {k: config[k] for k in CONFIG_GUARDABLE}
+    CONFIG_PATH.write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ordenar_periodos(combo: QComboBox):
+    """Deja 'Todos' primero y los periodos del más reciente al más antiguo ('Otros' al final)."""
+    actual = combo.currentText()
+    periodos = sorted(
+        (combo.itemText(i) for i in range(1, combo.count())),
+        key=lambda p: (p[:1].isdigit(), p), reverse=True,
+    )
+    combo.blockSignals(True)
+    combo.clear()
+    combo.addItems(["Todos", *periodos])
+    combo.setCurrentText(actual)
+    combo.blockSignals(False)
+
+
+# ── tareas ──
+ESTADOS_TAREA = {   # metadata.status del portal → (etiqueta, color)
+    "NOT_DELIVERED": ("Pendiente", ORANGE),
+    "DELIVERED": ("Entregada", GREEN),
+    "OUT_OF_DATE": ("Vencida", RED),
+    "SCHEDULED": ("Programada", TEXT_MUTED),
+}
+ORDEN_ESTADO = {"NOT_DELIVERED": 0, "SCHEDULED": 1, "OUT_OF_DATE": 2, "DELIVERED": 3}
+FILTROS_TAREA = {   # texto del combo → estados que muestra (None = todos)
+    "Pendientes": {"NOT_DELIVERED"},
+    "Próximas": {"NOT_DELIVERED", "SCHEDULED"},
+    "Vencidas sin entregar": {"OUT_OF_DATE"},
+    "Entregadas": {"DELIVERED"},
+    "Todas": None,
+}
+RE_PREFIJO_EMOJI = re.compile(r"^[^\w(¿¡]+")   # quita '📝', '🔴 ' etc. del inicio del título
+
+
+def estilo_flecha_combo() -> str:
+    """QSS solo acepta imágenes de archivo: se guarda el ícono caret una vez en logs/.
+    Requiere QApplication creada (por eso no va dentro de STYLE)."""
+    ruta = LOGS_DIR / "caret-down.png"
+    if not ruta.exists():
+        qta.icon("ph.caret-down", color=TEXT_MUTED).pixmap(12, 12).save(str(ruta))
+    return f"QComboBox::down-arrow {{ image: url({ruta.as_posix()}); width: 12px; height: 12px; margin-right: 8px; }}"
+
+
+def _fecha(texto: str) -> datetime:
+    try:
+        return datetime.strptime(texto[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return datetime.max
+
+
+def _tiempo_restante(vence: datetime, ahora: datetime) -> str:
+    if vence == datetime.max:
+        return "sin fecha"
+    dias = (vence.date() - ahora.date()).days
+    if vence < ahora:
+        return "vencida"
+    if dias == 0:
+        return "hoy"
+    if dias == 1:
+        return "mañana"
+    return f"en {dias} días"
+
 
 STYLE = f"""
 QMainWindow, QDialog {{
@@ -81,15 +172,6 @@ QComboBox {{
 QComboBox::drop-down {{
     border: none;
     width: 20px;
-}}
-QComboBox::down-arrow {{
-    image: none;
-    width: 0;
-    height: 0;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid {TEXT_MUTED};
-    margin-right: 8px;
 }}
 QComboBox QAbstractItemView {{
     background-color: #1c2027;
@@ -266,6 +348,31 @@ QProgressBar {{
 QProgressBar::chunk {{
     background-color: {BLUE};
     border-radius: 5px;
+}}
+QTabWidget::pane {{
+    border: none;
+    top: -1px;
+}}
+QTabBar::tab {{
+    background: transparent;
+    color: {TEXT_MUTED};
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 18px;
+    font-size: 13px;
+}}
+QTabBar::tab:selected {{
+    color: {TEXT_MAIN};
+    border-bottom: 2px solid {BLUE};
+}}
+QTabBar::tab:hover:!selected {{
+    color: {TEXT_MAIN};
+}}
+QToolTip {{
+    background-color: #1c2027;
+    color: {TEXT_MAIN};
+    border: 1px solid {BORDER};
+    padding: 4px 6px;
 }}
 """
 
@@ -576,12 +683,7 @@ class VentanaPrincipal(QMainWindow):
         self.setWindowTitle("UTP Class Downloader")
         self.resize(1500, 750)
 
-        self.config = {
-            "utp_user": "",
-            "utp_pass": "",
-            "base_dir": str(Path.home() / "Documents" / "utp-class-downloader"),
-            "zoom_workers": 4,
-        }
+        self.config = cargar_config()
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -599,6 +701,7 @@ class VentanaPrincipal(QMainWindow):
         btn_gear.setFixedSize(34, 34)
         btn_gear.setIcon(qta.icon("ph.gear", color=TEXT_MAIN))
         btn_gear.setIconSize(QSize(18, 18))
+        btn_gear.setToolTip("Configuración")
         btn_gear.clicked.connect(self.abrir_configuracion)
         header.addWidget(btn_gear)
         root.addLayout(header)
@@ -650,67 +753,14 @@ class VentanaPrincipal(QMainWindow):
 
         root.addLayout(toolbar)
 
-        # ── panel de resultados: cursos / materiales / videos ──
-        panel = QFrame()
-        panel.setObjectName("resultadosPanel")
-        panel_layout = QVBoxLayout(panel)
-        fila_titulo = QHBoxLayout()
-        label_resultados = QLabel("Cursos")
-        label_resultados.setProperty("muted", "true")
-        self.label_estado = QLabel("")
-        self.label_estado.setProperty("muted", "true")
-        self.progreso_bar = QProgressBar()
-        self.progreso_bar.setFixedWidth(160)
-        self.progreso_bar.setFixedHeight(18)
-        self.progreso_bar.setTextVisible(True)
-        self.progreso_bar.setVisible(False)
-        fila_titulo.addWidget(label_resultados)
-        fila_titulo.addStretch()
-        fila_titulo.addWidget(self.progreso_bar)
-        fila_titulo.addWidget(self.label_estado)
-
-        fila_filtro = QHBoxLayout()
-        label_periodo = QLabel("Periodo")
-        label_periodo.setProperty("muted", "true")
-        self.filtro_periodo = QComboBox()
-        self.filtro_periodo.addItem("Todos")
-        self.filtro_periodo.currentTextChanged.connect(self._filtrar)
-        fila_filtro.addWidget(label_periodo)
-        fila_filtro.addWidget(self.filtro_periodo)
-        fila_filtro.addStretch()
-
-        self.btn_detectar = QPushButton("Analizar Carpeta")
-        self.btn_detectar.setObjectName("seleccionar")
-        self.btn_detectar.setIcon(qta.icon("ph.magnifying-glass", color=TEXT_MAIN))
-        self.btn_detectar.setIconSize(QSize(14, 14))
-        self.btn_detectar.setToolTip("Buscar qué materiales/videos ya están descargados en disco")
-        self.btn_detectar.clicked.connect(self.detectar_descargas)
-        fila_filtro.addWidget(self.btn_detectar)
-
-        self.btn_seleccionar = QPushButton("Seleccionar")
-        self.btn_seleccionar.setObjectName("seleccionar")
-        self.btn_seleccionar.setCheckable(True)
-        self.btn_seleccionar.toggled.connect(self._toggle_modo_seleccion)
-        fila_filtro.addWidget(self.btn_seleccionar)
-
-        self.arbol = QTreeWidget()
-        self.arbol.setHeaderLabels(["Curso", "Periodo", "Materiales", "Videos", "Acciones", "En disco"])
-        self.arbol.setRootIsDecorated(False)
-        self.arbol.setColumnWidth(0, 280)
-        self.arbol.setColumnWidth(1, 100)
-        self.arbol.setColumnWidth(2, 100)
-        self.arbol.setColumnWidth(3, 100)
-        self.arbol.setColumnWidth(4, 300)
-        self.arbol.setColumnWidth(5, 160)
-        self.arbol.headerItem().setTextAlignment(4, Qt.AlignmentFlag.AlignCenter)
-        self.arbol.headerItem().setTextAlignment(5, Qt.AlignmentFlag.AlignCenter)
-        panel_layout.addLayout(fila_titulo)
-        panel_layout.addLayout(fila_filtro)
-        panel_layout.addWidget(self.arbol)
-        root.addWidget(panel, stretch=1)
+        # ── pestañas: Cursos / Tareas ──
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._crear_panel_cursos(), "Cursos")
+        self.tabs.addTab(self._crear_panel_tareas(), "Tareas")
+        root.addWidget(self.tabs, stretch=1)
 
         self.setCentralWidget(central)
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(STYLE + estilo_flecha_combo())
 
         self.worker = None
         self._todos_cursos = []
@@ -719,10 +769,101 @@ class VentanaPrincipal(QMainWindow):
         self._sel_videos = set()
         self._modo_seleccion = False
         self._cola_seleccionados = []
-        self._labels_estado = {}
-        self._detectado = {}
 
         self._preparar_chromium()
+
+    # ───────────────────────── construcción de paneles ─────────────────────────
+
+    def _crear_panel_cursos(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("resultadosPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 12, 14, 8)
+        panel_layout.setSpacing(10)
+
+        fila = QHBoxLayout()
+        label_periodo = QLabel("Periodo")
+        label_periodo.setProperty("muted", "true")
+        self.filtro_periodo = QComboBox()
+        self.filtro_periodo.addItem("Todos")
+        self.filtro_periodo.currentTextChanged.connect(self._filtrar)
+        fila.addWidget(label_periodo)
+        fila.addWidget(self.filtro_periodo)
+        fila.addSpacing(12)
+        self.label_estado = QLabel("")
+        self.label_estado.setProperty("muted", "true")
+        fila.addWidget(self.label_estado)
+        fila.addStretch()
+        self.progreso_bar = QProgressBar()
+        self.progreso_bar.setFixedWidth(160)
+        self.progreso_bar.setFixedHeight(18)
+        self.progreso_bar.setVisible(False)
+        fila.addWidget(self.progreso_bar)
+        self.btn_seleccionar = QPushButton("Seleccionar")
+        self.btn_seleccionar.setObjectName("seleccionar")
+        self.btn_seleccionar.setCheckable(True)
+        self.btn_seleccionar.setToolTip("Marcar materiales/clases de varios cursos y bajarlos juntos")
+        self.btn_seleccionar.toggled.connect(self._toggle_modo_seleccion)
+        fila.addWidget(self.btn_seleccionar)
+
+        self.arbol = QTreeWidget()
+        self.arbol.setHeaderLabels(["Curso", "Periodo", "Materiales", "Clases", "Descargar"])
+        self.arbol.setRootIsDecorated(False)
+        self.arbol.setColumnWidth(0, 420)
+        self.arbol.setColumnWidth(1, 110)
+        self.arbol.setColumnWidth(2, 130)
+        self.arbol.setColumnWidth(3, 130)
+        for col in (1, 2, 3, 4):
+            self.arbol.headerItem().setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
+
+        panel_layout.addLayout(fila)
+        panel_layout.addWidget(self.arbol)
+        return panel
+
+    def _crear_panel_tareas(self) -> QFrame:
+        panel = QFrame()
+        panel.setObjectName("resultadosPanel")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(14, 12, 14, 8)
+        panel_layout.setSpacing(10)
+
+        fila = QHBoxLayout()
+        label_mostrar = QLabel("Mostrar")
+        label_mostrar.setProperty("muted", "true")
+        self.filtro_estado_tarea = QComboBox()
+        self.filtro_estado_tarea.addItems(FILTROS_TAREA)
+        self.filtro_estado_tarea.currentTextChanged.connect(lambda _: self._pintar_tareas())
+        label_periodo = QLabel("Periodo")
+        label_periodo.setProperty("muted", "true")
+        self.filtro_periodo_tarea = QComboBox()
+        self.filtro_periodo_tarea.addItem("Todos")
+        self.filtro_periodo_tarea.currentTextChanged.connect(lambda _: self._pintar_tareas())
+        fila.addWidget(label_mostrar)
+        fila.addWidget(self.filtro_estado_tarea)
+        fila.addSpacing(12)
+        fila.addWidget(label_periodo)
+        fila.addWidget(self.filtro_periodo_tarea)
+        fila.addSpacing(12)
+        self.label_resumen_tareas = QLabel("Corre Iniciar para ver tus tareas")
+        self.label_resumen_tareas.setProperty("muted", "true")
+        fila.addWidget(self.label_resumen_tareas)
+        fila.addStretch()
+
+        self.arbol_tareas = QTreeWidget()
+        self.arbol_tareas.setHeaderLabels(["Estado", "Vence", "Curso", "Actividad", "Tipo", ""])
+        self.arbol_tareas.setRootIsDecorated(False)
+        self.arbol_tareas.setColumnWidth(0, 170)
+        self.arbol_tareas.setColumnWidth(1, 170)
+        self.arbol_tareas.setColumnWidth(2, 260)
+        self.arbol_tareas.setColumnWidth(3, 520)
+        self.arbol_tareas.setColumnWidth(4, 110)
+        self.arbol_tareas.itemDoubleClicked.connect(self._abrir_tarea_item)
+
+        panel_layout.addLayout(fila)
+        panel_layout.addWidget(self.arbol_tareas)
+        return panel
+
+    # ───────────────────────── flujo general ─────────────────────────
 
     def _preparar_chromium(self):
         self.btn_iniciar.setEnabled(False)
@@ -745,7 +886,10 @@ class VentanaPrincipal(QMainWindow):
         dialogo = ConfiguracionDialog(self, valores=self.config)
         if dialogo.exec():
             self.config = dialogo.obtener_valores()
-            self._log("OK", "#3b82f6", "Configuración guardada")
+            guardar_config(self.config)
+            self._log("OK", BLUE, "Configuración guardada")
+            if self._todos_cursos:
+                self.detectar_descargas()
 
     def _set_ocupado(self, ocupado: bool):
         # los 3 flujos abren Playwright sobre el mismo sesion/ — no pueden correr a la vez
@@ -759,12 +903,11 @@ class VentanaPrincipal(QMainWindow):
     def iniciar(self):
         self.logs_window.texto.clear()
         self.arbol.clear()
+        self.arbol_tareas.clear()
         self._todos_cursos = []
         self._widgets_fila = []
         self._sel_materiales = set()
         self._sel_videos = set()
-        self._labels_estado = {}
-        self._detectado = {}
         self.btn_seleccionar.blockSignals(True)
         self.btn_seleccionar.setChecked(False)
         self.btn_seleccionar.blockSignals(False)
@@ -772,10 +915,13 @@ class VentanaPrincipal(QMainWindow):
         self.btn_descargar_seleccionados.setVisible(False)
         self.btn_descargar_materiales.setVisible(False)
         self.btn_descargar_zoom.setVisible(False)
-        self.filtro_periodo.blockSignals(True)
-        self.filtro_periodo.clear()
-        self.filtro_periodo.addItem("Todos")
-        self.filtro_periodo.blockSignals(False)
+        for combo in (self.filtro_periodo, self.filtro_periodo_tarea):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Todos")
+            combo.blockSignals(False)
+        self.tabs.setTabText(1, "Tareas")
+        self.label_resumen_tareas.setText("Cargando...")
         self.label_estado.setText("Iniciando...")
         self._set_ocupado(True)
 
@@ -825,29 +971,36 @@ class VentanaPrincipal(QMainWindow):
         self._modo_seleccion = activo
         self._filtrar(self.filtro_periodo.currentText())
 
+    # ───────────────────────── disco ─────────────────────────
+
     def detectar_descargas(self):
-        if not self._todos_cursos:
-            self._log("WARN", "#f59e0b", "Primero corre Iniciar para tener la lista de cursos")
+        base_dir = self.config["base_dir"]
+        if not Path(base_dir).expanduser().is_dir():
+            self.label_estado.setText("No encuentro la carpeta de descargas — elígela en ⚙")
+            self._log("WARN", ORANGE, f"Carpeta de descargas no existe: {base_dir}")
             return
 
-        base_dir = self.config["base_dir"]
         for c in self._todos_cursos:
-            nombre = c["nombre"]
-            local = scrape.contar_archivos_locales(base_dir, c["periodo"], nombre)
-            mat_local, mat_total = local["archivos_locales"], c["materiales"]
-            vid_local, vid_total = local["videos_locales"], c["videos"]
+            c["disco"] = scrape.estado_en_disco(base_dir, c)
+        self._filtrar(self.filtro_periodo.currentText())
+        self._actualizar_resumen_cursos()
+        self._log("OK", BLUE, "Detección de archivos en disco completa")
 
-            if mat_local == 0 and vid_local == 0:
-                texto = "— Pendiente"
-            else:
-                texto = f"📄 {mat_local}/{mat_total} · 🎥 {vid_local}/{vid_total}"
-            self._detectado[nombre] = texto
+    def _actualizar_resumen_cursos(self):
+        visibles = self._cursos_visibles()
+        faltan_mat = sum(len(c["materiales"]) - c["disco"]["materiales_ok"] for c in visibles if "disco" in c)
+        faltan_vid = sum(
+            len(c["videos"]) - c["disco"]["videos_ok"] - c["disco"]["videos_no_disp"]
+            for c in visibles if "disco" in c
+        )
+        partes = [f"{len(visibles)} cursos"]
+        if faltan_mat or faltan_vid:
+            partes.append(f"faltan {faltan_mat} materiales y {faltan_vid} clases")
+        elif any("disco" in c for c in visibles):
+            partes.append("todo descargado")
+        self.label_estado.setText(" · ".join(partes))
 
-            label = self._labels_estado.get(nombre)
-            if label:
-                label.setText(texto)
-
-        self._log("OK", "#3b82f6", "Detección de archivos en disco completa")
+    # ───────────────────────── selección y descargas ─────────────────────────
 
     def descargar_seleccionados(self):
         materiales_sel = list(self._sel_materiales)
@@ -877,7 +1030,8 @@ class VentanaPrincipal(QMainWindow):
             return
         self._set_ocupado(False)
         self.progreso_bar.setVisible(False)
-        self.label_estado.setText(f"Listo — {resumen.get('ok', 0)} ok, {resumen.get('fail', 0)} fallidos")
+        self._log("SUCCESS", GREEN, f"Descarga terminada — {resumen.get('ok', 0)} ok, {resumen.get('fail', 0)} fallidos")
+        self.detectar_descargas()
 
     def _actualizar_progreso(self, actual: int, total: int):
         self.progreso_bar.setVisible(True)
@@ -885,49 +1039,74 @@ class VentanaPrincipal(QMainWindow):
         self.progreso_bar.setValue(actual)
         self.label_estado.setText(f"Procesando {actual}/{total} cursos...")
 
-    def _agregar_curso(self, c: dict):
-        self._todos_cursos.append(c)
-        if self.filtro_periodo.findText(c["periodo"]) == -1:
-            self.filtro_periodo.addItem(c["periodo"])
+    # ───────────────────────── tabla de cursos ─────────────────────────
 
-        filtro_actual = self.filtro_periodo.currentText()
-        if filtro_actual in ("Todos", c["periodo"]):
+    def _agregar_curso(self, c: dict):
+        if not (c["materiales"] or c["videos"] or c["tareas"]):
+            return   # cursos vacíos (ej. "Inducción", periodo 9999) solo meten ruido
+        self._todos_cursos.append(c)
+        for combo in (self.filtro_periodo, self.filtro_periodo_tarea):
+            if combo.findText(c["periodo"]) == -1:
+                combo.addItem(c["periodo"])
+
+        if self.filtro_periodo.currentText() in ("Todos", c["periodo"]):
             self._agregar_fila(c)
+
+    def _cursos_visibles(self) -> list[dict]:
+        periodo = self.filtro_periodo.currentText()
+        return [c for c in self._todos_cursos if periodo in ("Todos", c["periodo"])]
 
     def _agregar_fila(self, c: dict):
         nombre_curso = c["nombre"]
-        item = QTreeWidgetItem([nombre_curso, c["periodo"], "", "", "", ""])
+        item = QTreeWidgetItem([nombre_curso, c["periodo"], "", "", ""])
+        item.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+        item.setForeground(1, QColor(TEXT_MUTED))
         self.arbol.addTopLevelItem(item)
 
-        celda_mat = self._crear_celda_conteo(
-            nombre_curso, c["materiales"], self._sel_materiales, self._toggle_sel_materiales,
-        )
-        celda_vid = self._crear_celda_conteo(
-            nombre_curso, c["videos"], self._sel_videos, self._toggle_sel_videos,
-        )
-        widget_acciones = self._crear_widget_acciones(nombre_curso)
+        disco = c.get("disco")
+        mat_total, vid_total = len(c["materiales"]), len(c["videos"])
+        if disco:
+            mat = (disco["materiales_ok"], mat_total, 0)
+            vid = (disco["videos_ok"], vid_total, disco["videos_no_disp"])
+        else:
+            mat, vid = (None, mat_total, 0), (None, vid_total, 0)
 
-        label_estado_disco = QLabel(self._detectado.get(nombre_curso, "—"))
-        label_estado_disco.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label_estado_disco.setProperty("muted", "true")
-        self._labels_estado[nombre_curso] = label_estado_disco
+        self.arbol.setItemWidget(item, 2, self._crear_celda_conteo(
+            nombre_curso, *mat, self._sel_materiales, self._toggle_sel_materiales, "materiales"))
+        self.arbol.setItemWidget(item, 3, self._crear_celda_conteo(
+            nombre_curso, *vid, self._sel_videos, self._toggle_sel_videos, "clases"))
+        self.arbol.setItemWidget(item, 4, self._crear_widget_acciones(nombre_curso, mat_total, vid_total))
 
-        self.arbol.setItemWidget(item, 2, celda_mat)
-        self.arbol.setItemWidget(item, 3, celda_vid)
-        self.arbol.setItemWidget(item, 4, widget_acciones)
-        self.arbol.setItemWidget(item, 5, label_estado_disco)
+    def _crear_celda_conteo(self, nombre_curso: str, ok: int | None, total: int, no_disp: int,
+                            conjunto: set, on_toggle, que: str) -> QWidget:
+        """Celda 'descargados / total'. Verde = nada más por bajar; ámbar = faltan; gris = sin datos."""
+        if total == 0:
+            texto, color, tip = "—", TEXT_MUTED, f"Sin {que}"
+        elif ok is None:
+            texto, color, tip = str(total), TEXT_MAIN, f"{total} {que} en el portal"
+        else:
+            faltan = total - ok - no_disp
+            texto = f"{ok} / {total}"
+            color = GREEN if faltan == 0 else ORANGE
+            tip = f"{ok} descargados" + (f", faltan {faltan}" if faltan else "")
+            if no_disp:
+                tip += f"\n{no_disp} ya no están disponibles en Zoom"
 
-    def _crear_celda_conteo(self, nombre_curso: str, cantidad: int, conjunto: set, on_toggle):
-        if not self._modo_seleccion:
-            label = QLabel(str(cantidad))
-            label.setContentsMargins(8, 0, 0, 0)
-            return label
-
-        chk = QCheckBox(str(cantidad))
-        chk.setChecked(nombre_curso in conjunto)
-        chk.toggled.connect(lambda marcado, n=nombre_curso: on_toggle(n, marcado))
-        self._widgets_fila.append(chk)
-        return chk
+        contenedor = QWidget()
+        fila = QHBoxLayout(contenedor)
+        fila.setContentsMargins(0, 0, 0, 0)
+        fila.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if self._modo_seleccion and total:
+            widget = QCheckBox(texto)
+            widget.setChecked(nombre_curso in conjunto)
+            widget.toggled.connect(lambda marcado, n=nombre_curso: on_toggle(n, marcado))
+            self._widgets_fila.append(widget)
+        else:
+            widget = QLabel(texto)
+        widget.setStyleSheet(f"color: {color};")
+        widget.setToolTip(tip)
+        fila.addWidget(widget)
+        return contenedor
 
     def _toggle_sel_materiales(self, nombre_curso: str, marcado: bool):
         if marcado:
@@ -943,31 +1122,31 @@ class VentanaPrincipal(QMainWindow):
             self._sel_videos.discard(nombre_curso)
         self._actualizar_boton_seleccionados()
 
-    def _crear_widget_acciones(self, nombre_curso: str) -> QWidget:
+    def _crear_widget_acciones(self, nombre_curso: str, mat_total: int, vid_total: int) -> QWidget:
         contenedor = QWidget()
         fila = QHBoxLayout(contenedor)
         fila.setContentsMargins(0, 0, 0, 0)
-        fila.setSpacing(4)
+        fila.setSpacing(6)
+        fila.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        btn_mat = QPushButton("Descargar Materiales")
-        btn_mat.setObjectName("accionFila")
-        btn_mat.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_mat.setIcon(qta.icon("ph.file-text", color=TEXT_MAIN))
-        btn_mat.setIconSize(QSize(14, 14))
-        btn_mat.setToolTip(f"Descargar materiales de {nombre_curso}")
-        btn_mat.clicked.connect(lambda: self.descargar_materiales(nombres=[nombre_curso]))
-
-        btn_vid = QPushButton("Descargar Clases")
-        btn_vid.setObjectName("accionFila")
-        btn_vid.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_vid.setIcon(qta.icon("ph.video-camera", color=TEXT_MAIN))
-        btn_vid.setIconSize(QSize(14, 14))
-        btn_vid.setToolTip(f"Descargar clases grabadas de {nombre_curso}")
-        btn_vid.clicked.connect(lambda: self.descargar_zoom_clases(nombres=[nombre_curso]))
-
-        fila.addWidget(btn_mat)
-        fila.addWidget(btn_vid)
-        self._widgets_fila.extend([btn_mat, btn_vid])
+        botones = [
+            ("Materiales", "ph.file-text", mat_total, lambda: self.descargar_materiales(nombres=[nombre_curso])),
+            ("Clases", "ph.video-camera", vid_total, lambda: self.descargar_zoom_clases(nombres=[nombre_curso])),
+        ]
+        for texto, icono, total, accion in botones:
+            btn = QPushButton(texto)
+            btn.setObjectName("accionFila")
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setIcon(qta.icon(icono, color=TEXT_MAIN))
+            btn.setIconSize(QSize(14, 14))
+            btn.setFixedWidth(120)
+            btn.setToolTip(f"Descargar {texto.lower()} de {nombre_curso}")
+            btn.clicked.connect(accion)
+            if total:
+                self._widgets_fila.append(btn)
+            else:
+                btn.setEnabled(False)
+            fila.addWidget(btn)
         return contenedor
 
     def _actualizar_boton_seleccionados(self):
@@ -977,21 +1156,107 @@ class VentanaPrincipal(QMainWindow):
     def _filtrar(self, periodo: str):
         self.arbol.clear()
         self._widgets_fila = []
-        self._labels_estado = {}
         self._actualizar_boton_seleccionados()
         for c in self._todos_cursos:
             if periodo == "Todos" or c["periodo"] == periodo:
                 self._agregar_fila(c)
+        listando = self.worker is not None and self.worker.isRunning()
+        if self._todos_cursos and not listando:
+            self._actualizar_resumen_cursos()
 
     def _login_terminado(self, exito: bool):
         self._set_ocupado(False)
         self.progreso_bar.setVisible(False)
-        total = self.arbol.topLevelItemCount()
-        self.label_estado.setText(f"Listo — {total} cursos" if exito else "Falló")
-        if exito:
-            self.btn_descargar_materiales.setVisible(True)
-            self.btn_descargar_zoom.setVisible(True)
-            self.detectar_descargas()
+        if not exito:
+            self.label_estado.setText("Falló — revisa los logs")
+            self.label_resumen_tareas.setText("Sin datos")
+            return
+        self.btn_descargar_materiales.setVisible(True)
+        self.btn_descargar_zoom.setVisible(True)
+        for combo in (self.filtro_periodo, self.filtro_periodo_tarea):
+            ordenar_periodos(combo)
+        # en Tareas lo útil es el ciclo en curso: el periodo más reciente
+        if self.filtro_periodo_tarea.count() > 1:
+            self.filtro_periodo_tarea.setCurrentIndex(1)
+        self._pintar_tareas()
+        self.detectar_descargas()
+
+    # ───────────────────────── tareas ─────────────────────────
+
+    def _pintar_tareas(self):
+        self.arbol_tareas.clear()
+        if not self._todos_cursos:
+            return
+        periodo = self.filtro_periodo_tarea.currentText()
+        filtro = FILTROS_TAREA[self.filtro_estado_tarea.currentText()]
+        ahora = datetime.now()
+
+        tareas = [
+            t for c in self._todos_cursos if periodo in ("Todos", c["periodo"])
+            for t in c["tareas"]
+        ]
+        pendientes = [t for t in tareas if t["estado"] == "NOT_DELIVERED"]
+        urgentes = [t for t in pendientes if (_fecha(t["vence"]) - ahora).total_seconds() < 48 * 3600]
+        self.tabs.setTabText(1, f"Tareas ({len(pendientes)})" if pendientes else "Tareas")
+
+        partes = [f"{len(pendientes)} pendientes"]
+        if urgentes:
+            partes.append(f"{len(urgentes)} vencen en menos de 48 h")
+        vencidas = sum(t["estado"] == "OUT_OF_DATE" for t in tareas)
+        if vencidas:
+            partes.append(f"{vencidas} vencidas sin entregar")
+        self.label_resumen_tareas.setText(" · ".join(partes))
+
+        visibles = [t for t in tareas if filtro is None or t["estado"] in filtro]
+        visibles.sort(key=lambda t: (ORDEN_ESTADO.get(t["estado"], 9), t["vence"]))
+        for t in visibles:
+            self._agregar_fila_tarea(t, ahora)
+        if not visibles:
+            vacio = QTreeWidgetItem(["", "", "", "Nada que mostrar con este filtro"])
+            vacio.setForeground(3, QColor(TEXT_MUTED))
+            self.arbol_tareas.addTopLevelItem(vacio)
+
+    def _agregar_fila_tarea(self, t: dict, ahora: datetime):
+        vence = _fecha(t["vence"])
+        etiqueta, color = ESTADOS_TAREA.get(t["estado"], (t["estado"] or "—", TEXT_MUTED))
+        if t["estado"] == "NOT_DELIVERED" and (vence - ahora).total_seconds() < 48 * 3600:
+            color = RED
+
+        texto_vence = vence.strftime("%d/%m %H:%M") if t["vence"] else "—"
+        if t["estado"] in ("NOT_DELIVERED", "SCHEDULED"):
+            texto_vence += f"  ·  {_tiempo_restante(vence, ahora)}"
+
+        titulo = RE_PREFIJO_EMOJI.sub("", t["titulo"])
+        tipo = t["tipo"] + (" ★" if t["calificada"] else "")
+        item = QTreeWidgetItem([f"●  {etiqueta}", texto_vence, t["curso"], titulo, tipo, ""])
+        item.setForeground(0, QColor(color))
+        item.setForeground(1, QColor(TEXT_MAIN if t["estado"] == "NOT_DELIVERED" else TEXT_MUTED))
+        item.setForeground(2, QColor(TEXT_MUTED))
+        item.setForeground(4, QColor(TEXT_MUTED))
+        item.setToolTip(3, t["titulo"])
+        item.setToolTip(4, "★ = calificada" if t["calificada"] else "")
+        item.setData(0, Qt.ItemDataRole.UserRole, t["url"])
+        self.arbol_tareas.addTopLevelItem(item)
+
+        btn = QPushButton("Abrir")
+        btn.setObjectName("accionFila")
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn.setIcon(qta.icon("ph.arrow-square-out", color=TEXT_MAIN))
+        btn.setIconSize(QSize(14, 14))
+        btn.setFixedWidth(90)
+        btn.setToolTip("Abrir en el portal UTP")
+        btn.clicked.connect(lambda _=False, url=t["url"]: QDesktopServices.openUrl(QUrl(url)))
+        contenedor = QWidget()
+        fila = QHBoxLayout(contenedor)
+        fila.setContentsMargins(0, 0, 0, 0)
+        fila.addWidget(btn)
+        fila.addStretch()
+        self.arbol_tareas.setItemWidget(item, 5, contenedor)
+
+    def _abrir_tarea_item(self, item: QTreeWidgetItem, _columna: int):
+        url = item.data(0, Qt.ItemDataRole.UserRole)
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
 
     def _log(self, nivel: str, color: str, mensaje: str):
         self.logs_window.agregar(nivel, color, mensaje)

@@ -31,14 +31,17 @@ venv/bin/python main_ui.py
 
 ## Uso
 
-1. Abre **⚙ Configuración** y pon tu usuario/contraseña de UTP, la carpeta donde quieres guardar los materiales, y cuántas grabaciones Zoom descargar en paralelo (1-8).
-2. Dale a **Iniciar** — abre Chromium, loguea solo, y lista todos tus cursos (activos y de ciclos pasados) con cuántos materiales y videos tiene cada uno.
-3. Al terminar, aparecen dos botones: **Todos los materiales** y **Todas las clases** (descarga masiva), y la app analiza sola qué ya tienes en disco (columna **En disco**).
-4. Por curso, en la columna **Acciones**, puedes descargar materiales o clases de ese curso puntual.
-5. Con **Seleccionar** activado, marca Materiales/Videos de varios cursos a la vez y usa **Descargar Seleccionados** para bajarlos todos juntos.
-6. El botón **❯_** abre una ventana aparte con el log técnico completo de lo que está pasando.
+1. Credenciales: copia `.env.example` a `.env` y completa `UTP_USER`/`UTP_PASS`, o escríbelas en **⚙ Configuración** (ahí no se guardan).
+2. En **⚙** elige la carpeta donde guardas las descargas y cuántas grabaciones Zoom bajar en paralelo (1-8). Esto sí se recuerda (`config.json`).
+3. Dale a **Iniciar** — abre Chromium, loguea solo, y lista todos tus cursos (activos y de ciclos pasados).
+4. Pestaña **Cursos**: las columnas **Materiales** y **Clases** muestran `descargados / total`, comparando archivo por archivo con tu carpeta. Verde = nada más por bajar, ámbar = faltan (el tooltip dice cuántos y cuántas grabaciones ya no existen en Zoom). El resumen de arriba suma lo que falta del periodo elegido.
+5. Descarga por curso con los botones **Materiales** / **Clases**, todo junto con **Todos los materiales** / **Todas las clases**, o activa **Seleccionar** para marcar varios cursos y usar **Descargar Seleccionados**. Al terminar, los conteos se actualizan solos.
+6. Pestaña **Tareas**: tareas y evaluaciones del periodo con su estado (Pendiente, Entregada, Vencida, Programada), fecha límite, tiempo restante y botón **Abrir** que te lleva directo a la tarea en el portal. En rojo las pendientes que vencen en menos de 48 h; ★ = calificada.
+7. El botón **❯_** abre el log técnico; también queda guardado en `logs/app.log`.
 
-Las descargas son reanudables: si ya bajaste la mitad de un curso, la próxima corrida solo baja lo que falta — nunca vuelve a descargar un archivo que ya existe.
+Las descargas son reanudables: la próxima corrida solo baja lo que falta — nunca vuelve a descargar un archivo que ya existe.
+
+> **Zoom borra las grabaciones a los pocos meses.** Descarga las clases del ciclo en curso antes de que terminen; las de ciclos viejos suelen salir como `.skip`.
 
 ## Estructura de archivos descargados
 
@@ -61,12 +64,12 @@ BASE_DIR/
 | Extensión | Significado |
 |-----------|-------------|
 | `.mp4` | Grabación descargada OK |
-| `.skip` | Grabación eliminada por el profesor — no se reintenta |
+| `.skip` | Grabación que ya no existe en Zoom (expiró o la borró el profesor) — no se reintenta |
 | `.fail` | Falló el último intento (red, timeout) — se reintenta en la próxima corrida |
 
 ## Seguridad
 
-- Tu usuario/contraseña de UTP se guardan solo en memoria mientras la app está abierta (no hay `.env` ni base de datos) — se piden de nuevo cada vez que abres el programa.
+- Tu usuario/contraseña de UTP viven en tu `.env` local (ignorado por git) o solo en memoria si los escribes en ⚙. `config.json` nunca guarda la contraseña.
 - Nada se envía a ningún servidor externo aparte del propio portal de UTP y Zoom.
 - La sesión de Playwright (cookies de login) se guarda localmente en `sesion/` — no se sube al repositorio (ver `.gitignore`). Bórrala si cambias de cuenta.
 

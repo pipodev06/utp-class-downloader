@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from playwright.sync_api import sync_playwright
 
-from scrape import obtener_token, obtener_cursos, obtener_zoom, resolver_ciclo, sanitizar
+from scrape import obtener_token, obtener_cursos, obtener_zoom, grabaciones, resolver_ciclo, sanitizar
 
 ERRORES_ZOOM = [
     "esta grabación no existe", "this recording does not exist",
@@ -35,7 +35,7 @@ def _descargar_uno(rec: dict, storage_state: dict, base_dir: Path) -> tuple[bool
 
     carpeta = base_dir / ciclo / sanitizar(curso) / "videos"
     carpeta.mkdir(parents=True, exist_ok=True)
-    destino = carpeta / f"{sanitizar(titulo)}.mp4"
+    destino = carpeta / f"{rec['archivo']}.mp4"
     marca_skip = destino.with_suffix(".skip")
     marca_fail = destino.with_suffix(".fail")
 
@@ -143,15 +143,13 @@ def descargar_zoom(
     pendientes = []
     for curso in cursos:
         ciclo = resolver_ciclo(curso["periodo"])
-        for clase in obtener_zoom(curso["courseId"], curso["sectionId"], headers):
-            play_url = clase.get("playUrl") or ""
-            if not play_url:
-                continue
+        for g in grabaciones(obtener_zoom(curso["courseId"], curso["sectionId"], headers)):
             pendientes.append({
-                "titulo": clase.get("title", "sin_titulo"),
+                "titulo": g["titulo"],
+                "archivo": g["archivo"],
                 "curso": curso["nombre"],
                 "periodo": ciclo,
-                "grabacion": play_url,
+                "grabacion": g["url"],
             })
 
     total = len(pendientes)

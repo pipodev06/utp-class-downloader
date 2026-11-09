@@ -9,7 +9,7 @@ import requests
 
 from scrape import (
     obtener_token, obtener_cursos, obtener_contenido,
-    resolver_ciclo, sanitizar, SKIP_TIPOS, EXT_OK,
+    materiales_descargables, resolver_ciclo, sanitizar,
 )
 
 
@@ -51,33 +51,13 @@ def descargar_materiales(
 
         items = obtener_contenido(curso["courseId"], curso["sectionId"], headers)
         nuevos = 0
-        for item in items:
-            tipo = (item.get("type") or "").upper()
-            meta = item.get("metadata") or {}
-            if tipo in SKIP_TIPOS:
-                continue
-
-            titulo = item.get("title") or item.get("name") or "archivo"
-            semana = item.get("_week", 0)
-            url = (meta.get("url") or meta.get("videoUrl") or meta.get("fileUrl") or
-                   meta.get("src") or meta.get("link") or "")
-            if not url or not url.startswith("http"):
-                continue
-
-            es_s3 = "s3.amazonaws.com" in url
-            ext = Path(url.split("?")[0]).suffix.lower()
-            if not es_s3 and ext not in EXT_OK:
-                continue
-            if not ext:
-                ext = ".bin"
-
-            nombre_archivo = sanitizar(f"S{semana:02d}_{titulo}") + ext
+        for material in materiales_descargables(items):
+            nombre_archivo = material["archivo"]
             destino = carpeta / nombre_archivo
-
             if destino.exists():
                 continue
 
-            if _descargar_archivo(url, destino, log=log):
+            if _descargar_archivo(material["url"], destino, log=log):
                 ok += 1
                 nuevos += 1
                 log("SUCCESS", "#22c55e", f"{curso['nombre']} — {nombre_archivo}")
