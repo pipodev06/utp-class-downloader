@@ -4,11 +4,13 @@ Exporta la sesión de Playwright y descarga cada grabación en paralelo (headles
   BASE_DIR/<ciclo>/<curso>/videos/
 Portado de zoom_download.py del proyecto original.
 """
-from pathlib import Path
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PwTimeout, sync_playwright
 
+import auth
 from scrape import sanitizar, sesion_api
 
 ERRORES_ZOOM = [
@@ -18,16 +20,68 @@ ERRORES_ZOOM = [
 ]
 
 
+_RE_BOTON_DESCARGA = re.compile(r"^(download|descargar)\s*\(", re.I)
+ZOOM_SSO = "https://utpvirtual.zoom.us/web/sso/login?en=signin"
+
+
 class ZoomPideLogin(Exception):
     """La grabación redirigió a 'Sign In | Zoom': la sesión no tiene cookies de Zoom (SSO UTP vía Microsoft)."""
 
 
-def exportar_sesion(sesion_dir: str) -> dict:
+def _pide_login(page) -> bool:
+    return "zoom.us/signin" in page.url or "/web/sso/" in page.url
+
+
+def _login_zoom(page, log=print):
+    """SSO de Zoom de la UTP: Microsoft con <UTP_USER>@utp.edu.pe + UTP_PASS (sin MFA, probado 2026-11-09).
+    Acepta "¿Mantener la sesión iniciada?" para que las cookies de Zoom duren entre corridas."""
+    if not auth.UTP_USER or not auth.UTP_PASS:
+        raise ZoomPideLogin("Faltan UTP_USER/UTP_PASS para iniciar sesión en Zoom")
+    correo = auth.UTP_USER if "@" in auth.UTP_USER else f"{auth.UTP_USER}@utp.edu.pe"
+    log("INFO", "gray", "Iniciando sesión en Zoom (SSO UTP / Microsoft)...")
+    page.goto(ZOOM_SSO, wait_until="domcontentloaded", timeout=40000)
+    page.get_by_role("button", name="Continue").click()
+    page.wait_for_url("**login.microsoftonline.com/**", timeout=30000)
+    page.locator("input[name=loginfmt]").fill(correo)
+    page.locator("#idSIButton9").click()
+    try:
+        page.locator("input[name=passwd]").wait_for(state="visible", timeout=20000)
+    except PwTimeout:
+        raise ZoomPideLogin("Microsoft no aceptó el correo UTP para Zoom") from None
+    page.locator("input[name=passwd]").fill(auth.UTP_PASS)
+    page.locator("#idSIButton9").click()
+    for _ in range(30):
+        page.wait_for_timeout(1000)
+        if "zoom.us" in page.url and not _pide_login(page):
+            log("SUCCESS", "#22c55e", "Sesión de Zoom iniciada")
+            return
+        error = page.locator("#passwordError")
+        if error.count() and error.is_visible():
+            raise ZoomPideLogin("Microsoft rechazó la contraseña para Zoom")
+        mantener = page.locator("#KmsiCheckboxField, #idBtn_Back")
+        if mantener.count() and mantener.first.is_visible():
+            page.locator("#idSIButton9").click()   # ¿Mantener la sesión iniciada? → Sí
+    raise ZoomPideLogin("El login de Zoom no terminó (¿pide un código de verificación?)")
+
+
+def exportar_sesion(sesion_dir: str, url_prueba: str, log=print) -> dict:
+    """Cookies de la sesión para los navegadores de descarga. Antes comprueba con una grabación
+    que Zoom la acepte; si redirige a Sign In, inicia sesión por SSO y vuelve a comprobar."""
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(user_data_dir=sesion_dir, headless=True)
-        state = ctx.storage_state()
-        ctx.close()
-    return state
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto(url_prueba, wait_until="domcontentloaded", timeout=40000)
+            page.wait_for_timeout(3000)
+            if _pide_login(page):
+                _login_zoom(page, log)
+                page.goto(url_prueba, wait_until="domcontentloaded", timeout=40000)
+                page.wait_for_timeout(3000)
+                if _pide_login(page):
+                    raise ZoomPideLogin("Zoom sigue pidiendo iniciar sesión después del SSO")
+            return ctx.storage_state()
+        finally:
+            ctx.close()
 
 
 def _descargar_uno(rec: dict, storage_state: dict, base_dir: Path) -> tuple[bool, str]:
@@ -71,7 +125,7 @@ def _descargar_uno(rec: dict, storage_state: dict, base_dir: Path) -> tuple[bool
             page.goto(play_url, wait_until="domcontentloaded", timeout=40000)
             page.wait_for_timeout(3000)
 
-            if "zoom.us/signin" in page.url or "/web/sso/" in page.url:
+            if _pide_login(page):
                 raise ZoomPideLogin()   # sin cookies de Zoom: no tiene sentido esperar ni marcar .fail
 
             body = (page.inner_text("body") or "").lower()
@@ -94,10 +148,12 @@ def _descargar_uno(rec: dict, storage_state: dict, base_dir: Path) -> tuple[bool
                     continue
 
             if not clicked:
+                # el botón real dice "Download (182 MB)"; hay otros con "Download" (Download Center,
+                # Download the Zoom app) que sacan de la página, por eso se exige el tamaño entre paréntesis
                 for btn in page.query_selector_all("a, button"):
                     try:
-                        txt = (btn.text_content() or "").lower().strip()
-                        if ("descargar" in txt or "download" in txt) and btn.is_visible():
+                        txt = (btn.text_content() or "").strip()
+                        if _RE_BOTON_DESCARGA.match(txt) and btn.is_visible():
                             btn.click(timeout=5000)
                             break
                     except Exception:
@@ -165,8 +221,12 @@ def descargar_zoom(
 
     sesion_api(sesion_dir, log=log)   # asegura sesión UTP vigente (login solo si el token venció)
 
-    log("INFO", "gray", "Exportando sesión...")
-    storage = exportar_sesion(sesion_dir)
+    log("INFO", "gray", "Comprobando sesión de Zoom...")
+    try:
+        storage = exportar_sesion(sesion_dir, pendientes[0]["grabacion"], log)
+    except ZoomPideLogin as e:
+        log("WARN", "#f59e0b", f"Zoom: {e}")
+        return {"ok": 0, "fail": 0, "zoom_login": True}
 
     ok = 0
     fail = 0
