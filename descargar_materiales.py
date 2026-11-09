@@ -2,7 +2,7 @@
 Descarga de materiales (PDF/PPTX/DOCX/... y los enlazados dentro de las lecturas) a partir de lo
 que ya listó scrape.listar_todo — sin login ni nuevas consultas a la API (los archivos están en S3
 y se bajan sin sesión). Guarda en:
-  BASE_DIR/<ciclo>/<curso>/archivos/
+  BASE_DIR/<ciclo>/<curso>/Semana NN/<archivo>   (semana 0 → General/)
   BASE_DIR/<ciclo>/<curso>/youtube.html   (enlaces de YouTube por semana, no se descargan)
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,7 +11,7 @@ from pathlib import Path
 import requests
 import requests.adapters
 
-from scrape import escribir_indice_youtube, sanitizar
+from scrape import carpeta_curso, escribir_indice_youtube
 
 
 def _descargar_archivo(http: requests.Session, url: str, destino: Path) -> str | None:
@@ -39,15 +39,13 @@ def descargar_materiales(
     base_dir: str, cursos: list[dict], workers: int = 4,
     log=print, progreso=lambda actual, total: None,
 ) -> dict:
-    base = Path(base_dir).expanduser()
-
     pendientes = []
     for curso in cursos:
-        carpeta = base / curso["periodo"] / sanitizar(curso["nombre"])
+        carpeta = carpeta_curso(base_dir, curso)
         if escribir_indice_youtube(carpeta, curso["nombre"], curso.get("youtube") or []):
             log("INFO", "gray", f"{curso['nombre']}: youtube.html con {len(curso['youtube'])} video(s)")
         for m in curso["materiales"]:
-            destino = carpeta / "archivos" / m["archivo"]
+            destino = carpeta / m["archivo"]   # 'Semana 05/Práctica.pdf'
             if not destino.exists():
                 pendientes.append((curso["nombre"], m["url"], destino))
 

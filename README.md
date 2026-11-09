@@ -47,15 +47,18 @@ Las descargas son reanudables: la próxima corrida solo baja lo que falta — nu
 
 ## Estructura de archivos descargados
 
+Cada curso tiene una carpeta por semana con todo lo de esa semana junto: lecturas, PDF, Office, videos de la UTP y la grabación de Zoom. Si tienes descargas hechas con versiones anteriores (`archivos\S05_…`, `videos\…`), la app las mueve sola a esta estructura la primera vez que lista tus cursos; no borra nada que sea distinto.
+
 ```
 BASE_DIR/
 ├── 2025-I/
 │   ├── MATEMÁTICA II/
-│   │   ├── archivos/
-│   │   │   ├── S01_Introducción.pdf
-│   │   │   └── S02_Vectores.pptx
-│   │   ├── videos/
-│   │   │   └── Semana 1 - Clase.mp4
+│   │   ├── General/                 (material sin semana: sílabo, guías del curso)
+│   │   ├── Semana 01/
+│   │   │   ├── Introducción.pdf
+│   │   │   └── MATEMÁTICA II (30978) ( Semana 1 ) -Martes.mp4
+│   │   ├── Semana 02/
+│   │   │   └── Vectores.pptx
 │   │   └── youtube.html
 │   └── ...
 └── 2025-II/

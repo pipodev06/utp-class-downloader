@@ -25,6 +25,7 @@ import auth
 import scrape
 import descargar_materiales
 import descargar_zoom
+import migrar_carpetas
 
 SESION_DIR = str(Path(__file__).parent / "sesion")
 
@@ -855,7 +856,7 @@ class VentanaPrincipal(QMainWindow):
         self.btn_iniciar.setEnabled(True)
         if not exito:
             self.label_estado.setText("Chromium no disponible — revisa los logs")
-        elif self._todos_cursos and scrape.token_vigente(SESION_DIR):
+        elif scrape.token_vigente(SESION_DIR):
             self.iniciar()   # refresco automático: con token vigente no abre ninguna ventana
         elif not self._todos_cursos:
             self.label_estado.setText("")
@@ -984,6 +985,11 @@ class VentanaPrincipal(QMainWindow):
             self.label_estado.setText("No encuentro la carpeta de descargas — elígela en ⚙")
             self._log("WARN", ORANGE, f"Carpeta de descargas no existe: {base_dir}")
             return
+
+        # descargas hechas con el esquema viejo (archivos/S05_..., videos/): se pasan a Semana NN/
+        # una sola vez; necesita el listado para ubicar cada grabación en su semana
+        if self._todos_cursos and migrar_carpetas.hay_esquema_viejo(base_dir):
+            migrar_carpetas.migrar(base_dir, self._todos_cursos, log=self._log)
 
         for c in self._todos_cursos:
             c["disco"] = scrape.estado_en_disco(base_dir, c)

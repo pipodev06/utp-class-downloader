@@ -1,17 +1,16 @@
 """
 Descarga real de grabaciones Zoom a partir de lo que ya listó scrape.listar_todo.
 Exporta la sesión de Playwright y descarga cada grabación en paralelo (headless) a:
-  BASE_DIR/<ciclo>/<curso>/videos/
+  BASE_DIR/<ciclo>/<curso>/Semana NN/<grabación>.mp4
 Portado de zoom_download.py del proyecto original.
 """
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PwTimeout, sync_playwright
 
 import auth
-from scrape import sanitizar, sesion_api
+from scrape import carpeta_curso, sesion_api
 
 ERRORES_ZOOM = [
     "esta grabación no existe", "this recording does not exist",
@@ -84,15 +83,12 @@ def exportar_sesion(sesion_dir: str, url_prueba: str, log=print) -> dict:
             ctx.close()
 
 
-def _descargar_uno(rec: dict, storage_state: dict, base_dir: Path) -> tuple[bool, str]:
+def _descargar_uno(rec: dict, storage_state: dict) -> tuple[bool, str]:
     titulo = rec["titulo"]
-    curso = rec["curso"]
     play_url = rec["grabacion"]
-    ciclo = rec["periodo"]
 
-    carpeta = base_dir / ciclo / sanitizar(curso) / "videos"
-    carpeta.mkdir(parents=True, exist_ok=True)
-    destino = carpeta / f"{rec['archivo']}.mp4"
+    destino = rec["destino"]   # <curso>/Semana NN/<nombre>.mp4
+    destino.parent.mkdir(parents=True, exist_ok=True)
     marca_skip = destino.with_suffix(".skip")
     marca_fail = destino.with_suffix(".fail")
 
@@ -196,23 +192,17 @@ def descargar_zoom(
 ) -> dict:
     """Descarga las grabaciones de 'cursos' (entradas de scrape.listar_todo, sin re-consultar la API).
     Solo lanza navegador para las que faltan: las ya bajadas o marcadas .skip se saltan antes."""
-    base = Path(base_dir).expanduser()
 
     pendientes = []
     ya = 0
     for curso in cursos:
-        carpeta = base / curso["periodo"] / sanitizar(curso["nombre"]) / "videos"
+        carpeta = carpeta_curso(base_dir, curso)
         for g in curso["videos"]:
-            if (carpeta / f"{g['archivo']}.mp4").exists() or (carpeta / f"{g['archivo']}.skip").exists():
+            destino = carpeta / f"{g['archivo']}.mp4"
+            if destino.exists() or destino.with_suffix(".skip").exists():
                 ya += 1
                 continue
-            pendientes.append({
-                "titulo": g["titulo"],
-                "archivo": g["archivo"],
-                "curso": curso["nombre"],
-                "periodo": curso["periodo"],
-                "grabacion": g["url"],
-            })
+            pendientes.append({"titulo": g["titulo"], "destino": destino, "grabacion": g["url"]})
 
     total = len(pendientes)
     log("SUCCESS", "#22c55e", f"{total} grabaciones por bajar ({ya} ya descargadas o no disponibles)")
@@ -233,7 +223,7 @@ def descargar_zoom(
     procesados = 0
     pide_login = False
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futuros = {pool.submit(_descargar_uno, r, storage, base): r for r in pendientes}
+        futuros = {pool.submit(_descargar_uno, r, storage): r for r in pendientes}
         for fut in as_completed(futuros):
             procesados += 1
             try:

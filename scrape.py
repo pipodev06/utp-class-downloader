@@ -198,6 +198,28 @@ def _nombre_unico(base: str, usados: dict) -> str:
     return base if usados[base] == 1 else f"{base} ({usados[base]})"
 
 
+# ── organización en disco: <periodo>/<curso>/Semana NN/<archivo> (semana 0 → General) ──
+
+def carpeta_semana(semana: int) -> str:
+    return f"Semana {semana:02d}" if semana else "General"
+
+
+def _ruta_material(semana: int, base_con_prefijo: str, ext: str) -> str:
+    """'S05_Práctica (2)' → 'Semana 05/Práctica (2).pdf'.
+    Es el nombre histórico (con prefijo, ya recortado a 120) sin 'S05_': así cada archivo
+    descargado con el esquema viejo (archivos/S05_...) tiene un único destino al migrar."""
+    return f"{carpeta_semana(semana)}/{base_con_prefijo[4:].strip()}{ext}"
+
+
+_RE_SEMANA = re.compile(r"semana\s*(\d{1,2})", re.I)
+
+
+def semana_de_texto(texto: str) -> int:
+    """'Semana 1' / 'CÁLCULO II (21180) ( Semana 12 ) -Lunes' → 1 / 12; 0 si no dice."""
+    m = _RE_SEMANA.search(texto or "")
+    return int(m.group(1)) if m else 0
+
+
 # archivos enlazados DENTRO de las lecturas (contenido HTML): documentos y videos de la UTP.
 # mp3 (audios de Inglés) e imágenes (banners) se dejan fuera a propósito.
 EXT_INCRUSTADOS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".mp4", ".m4v"}
@@ -211,6 +233,8 @@ _ES_YOUTUBE = re.compile(r"^https?://(?:www\.)?(?:youtube\.com|youtu\.be)/", re.
 
 def _urls(patron: re.Pattern, texto: str) -> list[str]:
     return [next(g for g in grupos if g) for grupos in patron.findall(texto)]
+
+
 _RE_YOUTUBE_ID = re.compile(r"(?:embed/|watch\?v=|youtu\.be/|shorts/)([\w-]{11})")
 
 
@@ -266,8 +290,9 @@ def materiales_descargables(items: list[dict]) -> list[dict]:
             continue
         vistos.add(url)
         titulo = item.get("title") or item.get("name") or "archivo"
-        base = sanitizar(f"S{item.get('_week') or 0:02d}_{titulo}")
-        resultado.append({"archivo": _nombre_unico(base, usados) + (ext or ".bin"), "url": url})
+        semana = item.get("_week") or 0
+        base = _nombre_unico(sanitizar(f"S{semana:02d}_{titulo}"), usados)
+        resultado.append({"archivo": _ruta_material(semana, base, ext or ".bin"), "url": url})
 
     # 2ª pasada: archivos enlazados dentro de las lecturas (si no salieron ya como sueltos)
     for item in items:
@@ -279,8 +304,9 @@ def materiales_descargables(items: list[dict]) -> list[dict]:
                 continue
             vistos.add(url)
             ext = Path(unquote(url.split("?")[0])).suffix.lower()
-            base = sanitizar(f"S{item.get('_week') or 0:02d}_{titulo} - {original}")
-            resultado.append({"archivo": _nombre_unico(base, usados) + ext, "url": url})
+            semana = item.get("_week") or 0
+            base = _nombre_unico(sanitizar(f"S{semana:02d}_{titulo} - {original}"), usados)
+            resultado.append({"archivo": _ruta_material(semana, base, ext), "url": url})
     return resultado
 
 
@@ -334,8 +360,9 @@ def escribir_indice_youtube(carpeta: Path, nombre_curso: str, enlaces: list[dict
 
 
 def grabaciones(zoom: list[dict]) -> list[dict]:
-    """Grabaciones con URL: [{titulo, archivo (sin extensión), url}].
-    Varias clases comparten título (ej. 'CURSO - 19591'), por eso el nombre se desambigua."""
+    """Grabaciones con URL: [{titulo, archivo ('Semana NN/<nombre>', sin extensión), url}].
+    Varias clases comparten título (ej. 'CURSO - 19591'), por eso el nombre se desambigua
+    (por curso, igual que antes: el nombre de archivo no cambió, solo la carpeta)."""
     resultado = []
     usados: dict = {}
     for clase in zoom:
@@ -343,9 +370,10 @@ def grabaciones(zoom: list[dict]) -> list[dict]:
         if not url:
             continue
         titulo = clase.get("title") or "sin_titulo"
+        semana = semana_de_texto(clase.get("weekNumber")) or semana_de_texto(titulo)
         resultado.append({
             "titulo": titulo,
-            "archivo": _nombre_unico(sanitizar(titulo), usados),
+            "archivo": f"{carpeta_semana(semana)}/{_nombre_unico(sanitizar(titulo), usados)}",
             "url": url,
         })
     return resultado
@@ -465,7 +493,8 @@ def es_nueva(tarea: dict) -> bool:
     return datetime.now() - datetime.fromisoformat(visto) < timedelta(days=DIAS_NUEVA)
 
 
-VERSION_CACHE = 1   # subir si cambia la forma de las entradas: la caché vieja se ignora
+VERSION_CACHE = 2   # subir si cambia la forma de las entradas: la caché vieja se ignora
+# v2: 'archivo' pasó a ser ruta relativa al curso ('Semana 05/...') en materiales y videos
 
 
 def guardar_cache(ruta: Path, cursos: list[dict]):
@@ -491,14 +520,17 @@ def cargar_cache(ruta: Path) -> tuple[str, list[dict]] | None:
 def estado_en_disco(base_dir: str, curso: dict) -> dict:
     """Compara archivo por archivo lo esperado del curso con lo que hay en disco.
     'videos_no_disp' = grabaciones marcadas .skip (Zoom ya las borró)."""
-    carpeta = Path(base_dir).expanduser() / curso["periodo"] / sanitizar(curso["nombre"])
-    archivos_dir = carpeta / "archivos"
-    videos_dir = carpeta / "videos"
+    carpeta = carpeta_curso(base_dir, curso)
     return {
-        "materiales_ok": sum((archivos_dir / m["archivo"]).exists() for m in curso["materiales"]),
-        "videos_ok": sum((videos_dir / f"{v['archivo']}.mp4").exists() for v in curso["videos"]),
+        "materiales_ok": sum((carpeta / m["archivo"]).exists() for m in curso["materiales"]),
+        "videos_ok": sum((carpeta / f"{v['archivo']}.mp4").exists() for v in curso["videos"]),
         "videos_no_disp": sum(
-            (videos_dir / f"{v['archivo']}.skip").exists() and not (videos_dir / f"{v['archivo']}.mp4").exists()
+            (carpeta / f"{v['archivo']}.skip").exists() and not (carpeta / f"{v['archivo']}.mp4").exists()
             for v in curso["videos"]
         ),
     }
+
+
+def carpeta_curso(base_dir: str, curso: dict) -> Path:
+    """<base>/<periodo>/<curso>: aquí cuelgan 'Semana NN/', 'General/' y youtube.html."""
+    return Path(base_dir).expanduser() / curso["periodo"] / sanitizar(curso["nombre"])
