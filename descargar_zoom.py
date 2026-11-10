@@ -5,6 +5,7 @@ Exporta la sesión de Playwright y descarga cada grabación en paralelo (headles
 Portado de zoom_download.py del proyecto original.
 """
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from playwright.sync_api import TimeoutError as PwTimeout, sync_playwright
@@ -83,9 +84,17 @@ def exportar_sesion(sesion_dir: str, url_prueba: str, log=print) -> dict:
             ctx.close()
 
 
-def _descargar_uno(rec: dict, storage_state: dict) -> tuple[bool, str]:
+DETENIDA = "detenida por el usuario"
+
+
+def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) -> tuple[str, str]:
+    """Una grabación → (estado, mensaje), estado en ok / omitida / fallo / detenida.
+    Si se cancela no se marca .fail: queda pendiente para la próxima corrida.
+    (Una descarga ya iniciada termina: Playwright la guarda de una sola vez.)"""
     titulo = rec["titulo"]
     play_url = rec["grabacion"]
+    if cancelar.is_set():
+        return "detenida", DETENIDA
 
     destino = rec["destino"]   # <curso>/Semana NN/<nombre>.mp4
     destino.parent.mkdir(parents=True, exist_ok=True)
@@ -93,9 +102,9 @@ def _descargar_uno(rec: dict, storage_state: dict) -> tuple[bool, str]:
     marca_fail = destino.with_suffix(".fail")
 
     if destino.exists():
-        return True, f"[ya existe] {titulo[:55]}"
+        return "ok", f"[ya existe] {titulo[:55]}"
     if marca_skip.exists():
-        return True, f"[no existe en Zoom] {titulo[:50]}"
+        return "omitida", f"[no existe en Zoom] {titulo[:50]}"
 
     descargado = {"ok": False}
 
@@ -129,7 +138,7 @@ def _descargar_uno(rec: dict, storage_state: dict) -> tuple[bool, str]:
                 if err in body:
                     marca_skip.touch()
                     marca_fail.unlink(missing_ok=True)
-                    return False, f"no existe (omitida): {titulo[:50]}"
+                    return "omitida", f"ya no existe en Zoom: {titulo[:50]}"
 
             clicked = False
             for sel in ["a[download]", "[data-testid='download-btn']",
@@ -158,13 +167,15 @@ def _descargar_uno(rec: dict, storage_state: dict) -> tuple[bool, str]:
             for i in range(600):
                 if descargado["ok"]:
                     break
+                if cancelar.is_set():
+                    return "detenida", DETENIDA
                 if i % 5 == 0:
                     body = (page.inner_text("body") or "").lower()
                     for err in ERRORES_ZOOM:
                         if err in body:
                             marca_skip.touch()
                             marca_fail.unlink(missing_ok=True)
-                            return False, f"no existe (omitida): {titulo[:50]}"
+                            return "omitida", f"ya no existe en Zoom: {titulo[:50]}"
                 page.wait_for_timeout(1000)
 
         except ZoomPideLogin:
@@ -181,17 +192,18 @@ def _descargar_uno(rec: dict, storage_state: dict) -> tuple[bool, str]:
     if destino.exists():
         marca_fail.unlink(missing_ok=True)
         mb = destino.stat().st_size / 1024 / 1024
-        return True, f"{titulo[:55]} ({mb:.0f} MB)"
+        return "ok", f"{titulo[:55]} ({mb:.0f} MB)"
     marca_fail.touch()
-    return False, f"no descargó: {titulo[:55]}"
+    return "fallo", f"no descargó: {titulo[:55]}"
 
 
 def descargar_zoom(
     sesion_dir: str, base_dir: str, cursos: list[dict], workers: int = 4,
-    log=print, progreso=lambda actual, total: None,
+    log=print, progreso=lambda actual, total: None, cancelar: threading.Event | None = None,
 ) -> dict:
     """Descarga las grabaciones de 'cursos' (entradas de scrape.listar_todo, sin re-consultar la API).
     Solo lanza navegador para las que faltan: las ya bajadas o marcadas .skip se saltan antes."""
+    cancelar = cancelar or threading.Event()
 
     pendientes = []
     ya = 0
@@ -218,34 +230,37 @@ def descargar_zoom(
         log("WARN", "#f59e0b", f"Zoom: {e}")
         return {"ok": 0, "fail": 0, "zoom_login": True}
 
-    ok = 0
-    fail = 0
+    cuenta = {"ok": 0, "omitida": 0, "fallo": 0, "detenida": 0}
     procesados = 0
     pide_login = False
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futuros = {pool.submit(_descargar_uno, r, storage): r for r in pendientes}
+        futuros = [pool.submit(_descargar_uno, r, storage, cancelar) for r in pendientes]
         for fut in as_completed(futuros):
             procesados += 1
             try:
-                exito, msg = fut.result()
-                if exito:
-                    ok += 1
+                estado, msg = fut.result()
+                cuenta[estado] += 1
+                if estado == "ok":
                     log("SUCCESS", "#22c55e", msg)
-                else:
-                    fail += 1
+                elif estado != "detenida":
                     log("WARN", "#f59e0b", msg)
             except ZoomPideLogin:
                 if not pide_login:   # se corta todo: las demás grabaciones darían lo mismo
                     pide_login = True
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    cancelar.set()
             except Exception as e:
-                fail += 1
+                cuenta["fallo"] += 1
                 log("WARN", "#f59e0b", f"excepción: {e}")
             progreso(procesados, total)
 
+    resumen = {"ok": cuenta["ok"], "fail": cuenta["fallo"]}
     if pide_login:
         log("WARN", "#f59e0b", "Zoom pide iniciar sesión (SSO UTP con Microsoft) — descarga detenida, "
             "no se marcó ninguna grabación como fallida")
-        return {"ok": ok, "fail": fail, "zoom_login": True}
-    log("SUCCESS", "#22c55e", f"Descarga Zoom completa — {ok} ok, {fail} fallidas")
-    return {"ok": ok, "fail": fail}
+        return {**resumen, "zoom_login": True}
+    detalle = f"{cuenta['ok']} ok, {cuenta['omitida']} ya no existen en Zoom, {cuenta['fallo']} fallidas"
+    if cancelar.is_set():
+        log("WARN", "#f59e0b", f"Descarga Zoom detenida — {detalle}, {cuenta['detenida']} quedan pendientes")
+        return {**resumen, "detenido": True}
+    log("SUCCESS", "#22c55e", f"Descarga Zoom completa — {detalle}")
+    return resumen

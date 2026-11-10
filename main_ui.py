@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import subprocess
+import threading
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -139,6 +140,16 @@ def _fecha(texto: str) -> datetime:
         return datetime.strptime(texto[:19], "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return datetime.max
+
+
+def _faltan(curso: dict) -> tuple[int | None, int | None]:
+    """(materiales, clases) que faltan bajar del curso; (None, None) si aún no se revisó el disco.
+    Las grabaciones que Zoom ya borró (.skip) no cuentan como faltantes."""
+    d = curso.get("disco")
+    if not d:
+        return None, None
+    return (len(curso["materiales"]) - d["materiales_ok"],
+            len(curso["videos"]) - d["videos_ok"] - d["videos_no_disp"])
 
 
 def _fecha_corta(iso: str) -> str:
@@ -433,7 +444,8 @@ class ChromiumWorker(QThread):
 
 class Trabajo(QThread):
     """Corre en segundo plano cualquier flujo (listar, materiales, Zoom) sin congelar la UI.
-    fn(log, progreso, curso_listo) -> resultado. 'terminado' emite el resultado, o None si falló."""
+    fn(log, progreso, curso_listo, cancelar) -> resultado. 'terminado' emite el resultado, o None
+    si falló. 'cancelar' (threading.Event) lo activa el botón Detener; cada flujo lo revisa."""
     log = Signal(str, str, str)   # nivel, color, mensaje
     progreso = Signal(int, int)   # actual, total
     curso = Signal(dict)          # una entrada de curso apenas está lista (solo el listado)
@@ -444,6 +456,7 @@ class Trabajo(QThread):
         self.fn = fn
         self.utp_user = utp_user
         self.utp_pass = utp_pass
+        self.cancelar = threading.Event()
 
     def run(self):
         # auth.py lee credenciales de módulo; solo hacen falta si el token guardado venció
@@ -455,6 +468,7 @@ class Trabajo(QThread):
                 lambda n, c, m: self.log.emit(n, c, m),
                 lambda a, t: self.progreso.emit(a, t),
                 lambda curso: self.curso.emit(curso),
+                self.cancelar,
             )
             self.terminado.emit(resultado)
         except Exception as e:
@@ -692,7 +706,7 @@ class VentanaPrincipal(QMainWindow):
         self.btn_descargar_materiales.setObjectName("accion")
         self.btn_descargar_materiales.setIcon(qta.icon("ph.download-simple", color=TEXT_MAIN))
         self.btn_descargar_materiales.setIconSize(QSize(16, 16))
-        self.btn_descargar_materiales.clicked.connect(lambda: self.descargar_materiales())
+        self.btn_descargar_materiales.clicked.connect(lambda: self.descargar("materiales"))
         self.btn_descargar_materiales.setVisible(False)
         toolbar.addWidget(self.btn_descargar_materiales)
 
@@ -700,9 +714,18 @@ class VentanaPrincipal(QMainWindow):
         self.btn_descargar_zoom.setObjectName("accion")
         self.btn_descargar_zoom.setIcon(qta.icon("ph.download-simple", color=TEXT_MAIN))
         self.btn_descargar_zoom.setIconSize(QSize(16, 16))
-        self.btn_descargar_zoom.clicked.connect(lambda: self.descargar_zoom_clases())
+        self.btn_descargar_zoom.clicked.connect(lambda: self.descargar("clases"))
         self.btn_descargar_zoom.setVisible(False)
         toolbar.addWidget(self.btn_descargar_zoom)
+
+        self.btn_detener = QPushButton("Detener")
+        self.btn_detener.setObjectName("accion")
+        self.btn_detener.setIcon(qta.icon("ph.stop-circle", color=TEXT_MAIN))
+        self.btn_detener.setIconSize(QSize(16, 16))
+        self.btn_detener.setToolTip("Para la descarga; lo que falte queda pendiente para la próxima")
+        self.btn_detener.clicked.connect(self.detener)
+        self.btn_detener.setVisible(False)
+        toolbar.addWidget(self.btn_detener)
 
         self.btn_descargar_seleccionados = QPushButton("Descargar Seleccionados")
         self.btn_descargar_seleccionados.setObjectName("seleccionados")
@@ -742,6 +765,7 @@ class VentanaPrincipal(QMainWindow):
         self._cola_seleccionados = []
         self._fecha_listado = ""      # ISO del último listado mostrado (caché o recién hecho)
         self._unidad_progreso = "cursos"
+        self._ocupado = False
 
         # lo último que se listó aparece al instante; el refresco llega en segundo plano
         cache = scrape.cargar_cache(CACHE_PATH)
@@ -877,12 +901,30 @@ class VentanaPrincipal(QMainWindow):
 
     def _set_ocupado(self, ocupado: bool):
         # los 3 flujos abren Playwright sobre el mismo sesion/ — no pueden correr a la vez
+        self._ocupado = ocupado
         self.btn_iniciar.setEnabled(not ocupado)
-        self.btn_descargar_materiales.setEnabled(not ocupado)
-        self.btn_descargar_zoom.setEnabled(not ocupado)
         self.btn_descargar_seleccionados.setEnabled(not ocupado)
         for widget in self._widgets_fila:
             widget.setEnabled(not ocupado)
+        if not ocupado:
+            self.btn_detener.setVisible(False)
+        self._actualizar_botones_masivos()
+
+    def _actualizar_botones_masivos(self):
+        """'Todos los materiales' / 'Todas las clases' actúan sobre el periodo filtrado:
+        el texto lo dice, y se apagan si en ese periodo ya no falta nada."""
+        periodo = self.filtro_periodo.currentText()
+        visibles = self._cursos_visibles()
+        faltan = [_faltan(c) for c in visibles]
+        for btn, i, todo, de_periodo in (
+            (self.btn_descargar_materiales, 0, "Todos los materiales", "Materiales de"),
+            (self.btn_descargar_zoom, 1, "Todas las clases", "Clases de"),
+        ):
+            btn.setText(todo if periodo == "Todos" else f"{de_periodo} {periodo}")
+            # sin detección de disco todavía (None) se asume que falta algo
+            pendiente = any(f[i] is None or f[i] > 0 for f in faltan)
+            btn.setEnabled(not self._ocupado and pendiente)
+            btn.setToolTip("" if pendiente else "Todo descargado en este periodo")
 
     def _reiniciar_vista(self):
         """Deja tablas, filtros y selección vacíos (antes de pintar un listado)."""
@@ -921,10 +963,14 @@ class VentanaPrincipal(QMainWindow):
         self._pintar_tareas()
         self.detectar_descargas()
 
-    def _lanzar(self, fn, al_terminar, unidad: str, con_credenciales: bool = False, en_vivo=None):
-        """Arranca un Trabajo en segundo plano con log y progreso conectados."""
+    def _lanzar(self, fn, al_terminar, unidad: str, con_credenciales: bool = False, en_vivo=None,
+                cancelable: bool = False):
+        """Arranca un Trabajo en segundo plano con log y progreso conectados.
+        cancelable=True muestra el botón Detener mientras corre (descargas; el listado tarda ~3 s)."""
         self._unidad_progreso = unidad
         self._set_ocupado(True)
+        self.btn_detener.setVisible(cancelable)
+        self.btn_detener.setEnabled(True)
         cred = (self.config["utp_user"], self.config["utp_pass"]) if con_credenciales else ()
         self.worker = Trabajo(fn, *cred)
         self.worker.log.connect(self._log)
@@ -942,36 +988,43 @@ class VentanaPrincipal(QMainWindow):
         self.label_resumen_tareas.setText("Actualizando...")
         self.label_estado.setText("Actualizando...")
         self._lanzar(
-            lambda log, prog, curso: scrape.listar_todo(SESION_DIR, log, prog, curso, previos=previos),
+            lambda log, prog, curso, _cancelar: scrape.listar_todo(SESION_DIR, log, prog, curso, previos=previos),
             self._login_terminado, "cursos", con_credenciales=True, en_vivo=self._agregar_curso,
         )
 
     def _cursos_para(self, nombres: list[str] | None) -> list[dict]:
-        return [c for c in self._todos_cursos if not nombres or c["nombre"] in nombres]
+        """Cursos nombrados, o sin nombres los del periodo filtrado (lo que el usuario está viendo)."""
+        if nombres is None:
+            return self._cursos_visibles()
+        return [c for c in self._todos_cursos if c["nombre"] in nombres]
 
-    def descargar_materiales(self, nombres: list[str] | None = None):
+    def descargar(self, que: str, nombres: list[str] | None = None):
+        """que = 'materiales' | 'clases'. Sin nombres: los cursos del periodo filtrado."""
+        cursos = self._cursos_para(nombres)
+        base_dir, paralelo = self.config["base_dir"], self.config["zoom_workers"]
         self.logs_window.texto.clear()
-        self.label_estado.setText(
-            f"Descargando materiales de {len(nombres)} curso(s)..." if nombres
-            else "Descargando materiales de todos los cursos..."
-        )
-        cursos, base_dir, paralelo = self._cursos_para(nombres), self.config["base_dir"], self.config["zoom_workers"]
-        self._lanzar(
-            lambda log, prog, _: descargar_materiales.descargar_materiales(base_dir, cursos, paralelo, log, prog),
-            self._descarga_terminada, "archivos",
-        )
+        self.label_estado.setText(f"Descargando {que} de {len(cursos)} curso(s)...")
+        if que == "materiales":
+            self._lanzar(
+                lambda log, prog, _curso, cancelar: descargar_materiales.descargar_materiales(
+                    base_dir, cursos, paralelo, log, prog, cancelar),
+                self._descarga_terminada, "archivos", cancelable=True,
+            )
+        else:
+            self._lanzar(
+                lambda log, prog, _curso, cancelar: descargar_zoom.descargar_zoom(
+                    SESION_DIR, base_dir, cursos, paralelo, log, prog, cancelar),
+                self._descarga_terminada, "clases", con_credenciales=True, cancelable=True,
+            )
 
-    def descargar_zoom_clases(self, nombres: list[str] | None = None):
-        self.logs_window.texto.clear()
-        self.label_estado.setText(
-            f"Descargando grabaciones de {len(nombres)} curso(s)..." if nombres
-            else "Descargando grabaciones de todos los cursos..."
-        )
-        cursos, base_dir, paralelo = self._cursos_para(nombres), self.config["base_dir"], self.config["zoom_workers"]
-        self._lanzar(
-            lambda log, prog, _: descargar_zoom.descargar_zoom(SESION_DIR, base_dir, cursos, paralelo, log, prog),
-            self._descarga_terminada, "clases", con_credenciales=True,
-        )
+    def detener(self):
+        """Pide a la descarga en curso que pare (termina lo que está a medio guardar y se detiene)."""
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancelar.set()
+            self._cola_seleccionados = []
+            self.btn_detener.setEnabled(False)
+            self.label_estado.setText("Deteniendo...")
+            self._log("WARN", ORANGE, "Detención pedida por el usuario")
 
     def _toggle_modo_seleccion(self, activo: bool):
         self._modo_seleccion = activo
@@ -999,11 +1052,10 @@ class VentanaPrincipal(QMainWindow):
 
     def _actualizar_resumen_cursos(self):
         visibles = self._cursos_visibles()
-        faltan_mat = sum(len(c["materiales"]) - c["disco"]["materiales_ok"] for c in visibles if "disco" in c)
-        faltan_vid = sum(
-            len(c["videos"]) - c["disco"]["videos_ok"] - c["disco"]["videos_no_disp"]
-            for c in visibles if "disco" in c
-        )
+        faltan = [_faltan(c) for c in visibles if "disco" in c]
+        faltan_mat = sum(f[0] for f in faltan)
+        faltan_vid = sum(f[1] for f in faltan)
+        self._actualizar_botones_masivos()
         partes = [f"{len(visibles)} cursos"]
         if faltan_mat or faltan_vid:
             partes.append(f"faltan {faltan_mat} materiales y {faltan_vid} clases")
@@ -1025,17 +1077,14 @@ class VentanaPrincipal(QMainWindow):
         if materiales_sel:
             self._cola_seleccionados.append(("materiales", materiales_sel))
         if videos_sel:
-            self._cola_seleccionados.append(("videos", videos_sel))
+            self._cola_seleccionados.append(("clases", videos_sel))
         self._procesar_siguiente_seleccionado()
 
     def _procesar_siguiente_seleccionado(self):
         if not self._cola_seleccionados:
             return
-        tipo, nombres = self._cola_seleccionados.pop(0)
-        if tipo == "materiales":
-            self.descargar_materiales(nombres=nombres)
-        else:
-            self.descargar_zoom_clases(nombres=nombres)
+        que, nombres = self._cola_seleccionados.pop(0)
+        self.descargar(que, nombres)
 
     def _descarga_terminada(self, resumen: dict | None):
         if self._cola_seleccionados:
@@ -1044,10 +1093,11 @@ class VentanaPrincipal(QMainWindow):
         resumen = resumen or {}
         self._set_ocupado(False)
         self.progreso_bar.setVisible(False)
-        self._log("SUCCESS", GREEN, f"Descarga terminada — {resumen.get('ok', 0)} ok, {resumen.get('fail', 0)} fallidos")
         self.detectar_descargas()
         if resumen.get("zoom_login"):
             self.label_estado.setText("Zoom pide iniciar sesión — las clases no se pudieron bajar (revisa los logs)")
+        elif resumen.get("detenido"):
+            self.label_estado.setText(f"Detenido · {resumen.get('ok', 0)} bajados · lo que faltó queda pendiente")
 
     def _actualizar_progreso(self, actual: int, total: int):
         self.progreso_bar.setVisible(True)
@@ -1091,7 +1141,7 @@ class VentanaPrincipal(QMainWindow):
             nombre_curso, *mat, self._sel_materiales, self._toggle_sel_materiales, "materiales"))
         self.arbol.setItemWidget(item, 3, self._crear_celda_conteo(
             nombre_curso, *vid, self._sel_videos, self._toggle_sel_videos, "clases"))
-        self.arbol.setItemWidget(item, 4, self._crear_widget_acciones(nombre_curso, mat_total, vid_total))
+        self.arbol.setItemWidget(item, 4, self._crear_widget_acciones(c))
 
     def _crear_celda_conteo(self, nombre_curso: str, ok: int | None, total: int, no_disp: int,
                             conjunto: set, on_toggle, que: str) -> QWidget:
@@ -1138,30 +1188,41 @@ class VentanaPrincipal(QMainWindow):
             self._sel_videos.discard(nombre_curso)
         self._actualizar_boton_seleccionados()
 
-    def _crear_widget_acciones(self, nombre_curso: str, mat_total: int, vid_total: int) -> QWidget:
+    def _crear_widget_acciones(self, c: dict) -> QWidget:
+        """Botones Materiales/Clases del curso. Completo → 'Materiales ✓' apagado; se vuelve a
+        activar solo cuando el listado trae algo nuevo que no está en disco."""
         contenedor = QWidget()
         fila = QHBoxLayout(contenedor)
         fila.setContentsMargins(0, 0, 0, 0)
         fila.setSpacing(6)
         fila.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        nombre_curso = c["nombre"]
+        faltan_mat, faltan_vid = _faltan(c)
         botones = [
-            ("Materiales", "ph.file-text", mat_total, lambda: self.descargar_materiales(nombres=[nombre_curso])),
-            ("Clases", "ph.video-camera", vid_total, lambda: self.descargar_zoom_clases(nombres=[nombre_curso])),
+            ("Materiales", "materiales", "ph.file-text", len(c["materiales"]), faltan_mat),
+            ("Clases", "clases", "ph.video-camera", len(c["videos"]), faltan_vid),
         ]
-        for texto, icono, total, accion in botones:
-            btn = QPushButton(texto)
+        for texto, que, icono, total, faltan in botones:
+            completo = bool(total) and faltan == 0
+            btn = QPushButton(f"{texto}  ✓" if completo else texto)
             btn.setObjectName("accionFila")
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setIcon(qta.icon(icono, color=TEXT_MAIN))
+            btn.setIcon(qta.icon(icono, color=TEXT_MUTED if completo or not total else TEXT_MAIN))
             btn.setIconSize(QSize(14, 14))
             btn.setFixedWidth(120)
-            btn.setToolTip(f"Descargar {texto.lower()} de {nombre_curso}")
-            btn.clicked.connect(accion)
-            if total:
-                self._widgets_fila.append(btn)
-            else:
+            btn.clicked.connect(lambda _=False, q=que: self.descargar(q, [nombre_curso]))
+            if not total:
                 btn.setEnabled(False)
+                btn.setToolTip(f"Este curso no tiene {que}")
+            elif completo:
+                btn.setEnabled(False)
+                btn.setToolTip("Todo descargado — se activa si aparece algo nuevo")
+            else:
+                self._widgets_fila.append(btn)
+                btn.setEnabled(not self._ocupado)
+                btn.setToolTip(f"Bajar {faltan} {que} que faltan de {nombre_curso}" if faltan
+                               else f"Descargar {que} de {nombre_curso}")
             fila.addWidget(btn)
         return contenedor
 
