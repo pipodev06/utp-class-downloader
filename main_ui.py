@@ -60,7 +60,7 @@ logger.setLevel(logging.INFO)
 logger.addHandler(_handler)
 sys.excepthook = lambda tipo, valor, tb: logger.critical("Excepción no capturada", exc_info=(tipo, valor, tb))
 
-# paleta (congelada en AGENTS.md)
+# paleta (congelada en CLAUDE.md)
 DARK_BG = "#0e1013"
 PANEL_BG = "#15181d"
 BORDER = "#262a31"
