@@ -12,10 +12,7 @@ from pathlib import Path
 import requests
 import requests.adapters
 
-from scrape import carpeta_curso, escribir_indice_youtube
-
-
-DETENIDA = "detenida por el usuario"
+from scrape import DETENIDA, carpeta_curso, descargado, escribir_indice_youtube, marcar_de_internet
 
 
 def _descargar_archivo(http: requests.Session, url: str, destino: Path, cancelar: threading.Event) -> str | None:
@@ -37,13 +34,24 @@ def _descargar_archivo(http: requests.Session, url: str, destino: Path, cancelar
             parcial.unlink(missing_ok=True)
             return DETENIDA
         parcial.replace(destino)
+        marcar_de_internet(destino, url)
         return None
-    except (requests.RequestException, OSError, ValueError) as e:
-        try:
-            parcial.unlink(missing_ok=True)
-        except OSError:
-            pass   # ruta inválida: no hay nada que borrar; el error real ya va en el mensaje
+    except requests.HTTPError as e:   # solo el código: str(e) trae la URL (puede ir firmada)
+        _borrar(parcial)
+        return f"HTTP {e.response.status_code}"
+    except requests.RequestException as e:
+        _borrar(parcial)
+        return type(e).__name__
+    except (OSError, ValueError) as e:
+        _borrar(parcial)
         return str(e)
+
+
+def _borrar(parcial: Path):
+    try:
+        parcial.unlink(missing_ok=True)
+    except OSError:
+        pass   # ruta inválida: no hay nada que borrar; el error real ya va en el mensaje
 
 
 def descargar_materiales(
@@ -58,7 +66,7 @@ def descargar_materiales(
             log("INFO", "gray", f"{curso['nombre']}: youtube.html con {len(curso['youtube'])} video(s)")
         for m in curso["materiales"]:
             destino = carpeta / m["archivo"]   # 'Semana 05/Práctica.pdf'
-            if not destino.exists():
+            if not descargado(destino):
                 pendientes.append((curso["nombre"], m["url"], destino))
 
     total = len(pendientes)

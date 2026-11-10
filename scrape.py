@@ -6,11 +6,12 @@ import base64
 import html
 import json
 import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import requests
 import requests.adapters
@@ -30,16 +31,25 @@ _PERIODO_ROMANO = {"2": "I", "3": "II"}
 def resolver_ciclo(periodo: str) -> str:
     m = _RE_PERIODO.match(periodo or "")
     if not m:
-        return "Otros" if periodo == "9999" else (periodo or "sin_ciclo")
+        # se sanitiza: el periodo viene de la API y termina siendo una carpeta
+        return "Otros" if periodo == "9999" else (sanitizar(periodo or "") or "sin_ciclo")
     anio = 2020 + int(m.group(1))
     return f"{anio}-{_PERIODO_ROMANO[m.group(2)]}"
 
 
+_RESERVADOS_WINDOWS = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                       *(f"LPT{i}" for i in range(1, 10))}
+
+
 def sanitizar(nombre: str) -> str:
     """Nombre válido en Windows. Los saltos de línea/tabs (vienen en algunos títulos del portal)
-    pasan a espacio: un '\\n' en la ruta abortaba la descarga entera (WinError 123)."""
+    pasan a espacio: un '\\n' en la ruta abortaba la descarga entera (WinError 123).
+    '.', '..' y nombres reservados (CON, NUL, COM1...) se anteponen con '_'."""
     nombre = re.sub(r"\s*[\x00-\x1f]+\s*", " ", nombre)
-    return re.sub(r'[\\/:*?"<>|]', "_", nombre).strip()[:120]
+    nombre = re.sub(r'[\\/:*?"<>|]', "_", nombre).strip()[:120]
+    if nombre.strip(" .") == "" or nombre.split(".")[0].strip().upper() in _RESERVADOS_WINDOWS:
+        nombre = f"_{nombre}"
+    return nombre
 
 SKIP_TIPOS = {"HTML", "FORUM", "TASK", "QUIZ", "SURVEY", "URL",
               "TEXT", "LINK", "H5P", "HOMEWORK", "ZOOM", "EVALUATION"}
@@ -153,10 +163,10 @@ def obtener_cursos(student_id: str, http: requests.Session) -> list[dict]:
     data = api_get(f"{API}/learning/student/{student_id}/dashboard-courses", http)
     if not data:
         return []
-    items = data if isinstance(data, list) else data.get("data", [])
+    items = data if isinstance(data, list) else (data.get("data") or [])
     cursos = []
     for c in items:
-        if c.get("courseId") and c.get("sectionId"):
+        if isinstance(c, dict) and c.get("courseId") and c.get("sectionId"):
             cursos.append({
                 "nombre":    c.get("name", "sin_nombre"),
                 "courseId":  c["courseId"],
@@ -171,11 +181,12 @@ def obtener_contenido(course_id: str, section_id: str, http: requests.Session) -
     resp = api_get(f"{API}/course/student/courses/{course_id}/sections/{section_id}/full", http)
     if resp is None:
         return None
+    # 'x or []' en cada nivel: la API a veces manda null en vez de lista y eso tumbaba el listado
     items = []
-    for unity in (resp.get("data") or {}).get("unities", []):
-        for theme in unity.get("themes", []):
+    for unity in (resp.get("data") or {}).get("unities") or []:
+        for theme in unity.get("themes") or []:
             week = theme.get("weekNumber") or 0
-            for content in theme.get("contents", []):
+            for content in theme.get("contents") or []:
                 content["_week"] = week
                 items.append(content)
     return items
@@ -188,14 +199,26 @@ def obtener_zoom(course_id: str, section_id: str, http: requests.Session) -> lis
     )
     if resp is None:
         return None
-    return (resp.get("data") or {}).get("listVideoConferenceResponse", [])
+    return (resp.get("data") or {}).get("listVideoConferenceResponse") or []
 
 
 def _nombre_unico(base: str, usados: dict) -> str:
     """Si el nombre ya salió en este curso, agrega ' (2)', ' (3)'...
-    La primera aparición conserva el nombre de siempre, así no se re-descarga lo que ya existe."""
-    usados[base] = usados.get(base, 0) + 1
-    return base if usados[base] == 1 else f"{base} ({usados[base]})"
+    La primera aparición conserva el nombre de siempre, así no se re-descarga lo que ya existe.
+    La clave ignora mayúsculas: en NTFS 'Práctica' y 'práctica' son el mismo archivo."""
+    clave = base.casefold()
+    usados[clave] = usados.get(clave, 0) + 1
+    return base if usados[clave] == 1 else f"{base} ({usados[clave]})"
+
+
+# solo se descarga por https y desde los servidores de la UTP (S3) y Zoom
+_HOSTS_ARCHIVOS = (".amazonaws.com",)
+_HOSTS_ZOOM = (".zoom.us",)
+
+
+def url_permitida(url: str, hosts: tuple[str, ...]) -> bool:
+    u = urlparse(url)
+    return u.scheme == "https" and bool(u.hostname) and u.hostname.endswith(hosts)
 
 
 # ── organización en disco: <periodo>/<curso>/Semana NN/<archivo> (semana 0 → General) ──
@@ -261,7 +284,8 @@ def _incrustados(item: dict) -> list[tuple[str, str]]:
     resultado = []
     for url in urls:
         url = html.unescape(url)
-        if "upload-file-storage" in url and Path(unquote(url.split("?")[0])).suffix.lower() in EXT_INCRUSTADOS:
+        if (url_permitida(url, _HOSTS_ARCHIVOS) and "upload-file-storage" in url
+                and Path(unquote(url.split("?")[0])).suffix.lower() in EXT_INCRUSTADOS):
             resultado.append((url, _nombre_original(url)))
     return resultado
 
@@ -280,11 +304,10 @@ def materiales_descargables(items: list[dict]) -> list[dict]:
             continue
         url = (meta.get("url") or meta.get("videoUrl") or meta.get("fileUrl") or
                meta.get("src") or meta.get("link") or "")
-        if not url or not url.startswith("http"):
+        if not url_permitida(url, _HOSTS_ARCHIVOS):
             continue
-        es_s3 = "s3.amazonaws.com" in url
-        ext = Path(url.split("?")[0]).suffix.lower()
-        if not es_s3 and ext not in EXT_OK:
+        ext = Path(unquote(url.split("?")[0])).suffix.lower()
+        if ext not in EXT_OK:   # también en S3: nada de .exe/.lnk/.hta aunque vengan de la UTP
             continue
         if url in vistos:
             continue
@@ -367,7 +390,7 @@ def grabaciones(zoom: list[dict]) -> list[dict]:
     usados: dict = {}
     for clase in zoom:
         url = clase.get("playUrl") or ""
-        if not url:
+        if not url_permitida(url, _HOSTS_ZOOM):
             continue
         titulo = clase.get("title") or "sin_titulo"
         semana = semana_de_texto(clase.get("weekNumber")) or semana_de_texto(titulo)
@@ -410,19 +433,29 @@ def extraer_tareas(items: list[dict], curso: dict) -> list[dict]:
     return tareas
 
 
+def clave_curso(curso: dict) -> str:
+    """Identidad de un curso: el mismo nombre puede repetirse en otro periodo (curso llevado de nuevo)."""
+    return f"{curso['courseId']}/{curso['sectionId']}"
+
+
 def _armar_entrada(curso: dict, http: requests.Session) -> dict:
-    """Una entrada por curso con TODO lo necesario para descargar sin volver a consultar la API."""
-    items = obtener_contenido(curso["courseId"], curso["sectionId"], http)
-    zoom = obtener_zoom(curso["courseId"], curso["sectionId"], http)
-    return {
-        "nombre": curso["nombre"], "periodo": resolver_ciclo(curso["periodo"]),
-        "courseId": curso["courseId"], "sectionId": curso["sectionId"],
-        "materiales": materiales_descargables(items or []),   # [{archivo, url}]
-        "videos": grabaciones(zoom or []),                     # [{titulo, archivo, url}]
-        "youtube": enlaces_youtube(items or []),
-        "tareas": extraer_tareas(items or [], curso),
-        "error": items is None or zoom is None,
-    }
+    """Una entrada por curso con TODO lo necesario para descargar sin volver a consultar la API.
+    Un curso con datos raros queda con error=True en vez de tumbar todo el listado."""
+    base = {"nombre": curso["nombre"], "periodo": resolver_ciclo(curso["periodo"]),
+            "courseId": curso["courseId"], "sectionId": curso["sectionId"]}
+    try:
+        items = obtener_contenido(curso["courseId"], curso["sectionId"], http)
+        zoom = obtener_zoom(curso["courseId"], curso["sectionId"], http)
+        return {
+            **base,
+            "materiales": materiales_descargables(items or []),   # [{archivo, url}]
+            "videos": grabaciones(zoom or []),                     # [{titulo, archivo, url}]
+            "youtube": enlaces_youtube(items or []),
+            "tareas": extraer_tareas(items or [], curso),
+            "error": items is None or zoom is None,
+        }
+    except (AttributeError, TypeError, KeyError, ValueError):
+        return {**base, "materiales": [], "videos": [], "youtube": [], "tareas": [], "error": True}
 
 
 def listar_todo(
@@ -446,16 +479,17 @@ def listar_todo(
         raise RuntimeError("La API no devolvió cursos — revisa tu conexión o vuelve a intentar")
     log("SUCCESS", "#22c55e", f"{len(cursos)} cursos encontrados")
 
-    por_nombre = {c["nombre"]: c for c in previos or []}
+    por_clave = {clave_curso(c): c for c in previos or []}
     total = len(cursos)
     resultado = []
     with ThreadPoolExecutor(PARALELO_API) as pool:
         for i, entrada in enumerate(pool.map(lambda c: _armar_entrada(c, http), cursos), start=1):
             if entrada["error"]:
-                previo = por_nombre.get(entrada["nombre"])
+                previo = por_clave.get(clave_curso(entrada))
                 log("WARN", "#f59e0b", f"{entrada['nombre']}: la API falló"
                     + (" — se muestra el último listado" if previo else ""))
-                entrada = previo or entrada
+                # se conserva el error=True: la UI avisa y no da por actualizado ese curso
+                entrada = {**previo, "error": True} if previo else entrada
             resultado.append(entrada)
             log("INFO", "gray", f"{entrada['nombre']}: {len(entrada['materiales'])} materiales, "
                 f"{len(entrada['videos'])} videos, {len(entrada['tareas'])} tareas")
@@ -479,18 +513,31 @@ def fusionar_vistos(cursos: list[dict], previos: list[dict] | None):
             for t in c["tareas"]:
                 t.setdefault("visto", "")
         return
-    vistos = {t["id"]: t.get("visto", "") for c in previos for t in c["tareas"]}
+    vistos = {t["id"]: t.get("visto", "") for c in previos for t in c["tareas"] if t.get("id")}
     ahora = datetime.now().isoformat(timespec="minutes")
     for c in cursos:
         for t in c["tareas"]:
-            t["visto"] = vistos.get(t["id"], ahora)
+            # sin id no se puede saber si es nueva: se trata como conocida
+            t["visto"] = vistos.get(t["id"], ahora) if t.get("id") else t.get("visto", "")
 
 
 def es_nueva(tarea: dict) -> bool:
     visto = tarea.get("visto")
     if not visto:
         return False
-    return datetime.now() - datetime.fromisoformat(visto) < timedelta(days=DIAS_NUEVA)
+    try:
+        return datetime.now() - datetime.fromisoformat(visto) < timedelta(days=DIAS_NUEVA)
+    except (TypeError, ValueError):   # caché editada o corrupta: no romper la pestaña Tareas
+        return False
+
+
+def fecha_portal(texto: str) -> datetime:
+    """Fechas del portal: '2026-11-15 23:59:59', '…59.000' o ISO con 'T'/'Z'. Sin fecha → datetime.max.
+    (Las fechas del portal son hora de Lima y se tratan como hora local.)"""
+    try:
+        return datetime.fromisoformat((texto or "").strip().replace("Z", "")[:19])
+    except ValueError:
+        return datetime.max
 
 
 VERSION_CACHE = 2   # subir si cambia la forma de las entradas: la caché vieja se ignora
@@ -522,15 +569,44 @@ def estado_en_disco(base_dir: str, curso: dict) -> dict:
     'videos_no_disp' = grabaciones marcadas .skip (Zoom ya las borró)."""
     carpeta = carpeta_curso(base_dir, curso)
     return {
-        "materiales_ok": sum((carpeta / m["archivo"]).exists() for m in curso["materiales"]),
-        "videos_ok": sum((carpeta / f"{v['archivo']}.mp4").exists() for v in curso["videos"]),
+        "materiales_ok": sum(descargado(carpeta / m["archivo"]) for m in curso["materiales"]),
+        "videos_ok": sum(descargado(carpeta / f"{v['archivo']}.mp4") for v in curso["videos"]),
         "videos_no_disp": sum(
-            (carpeta / f"{v['archivo']}.skip").exists() and not (carpeta / f"{v['archivo']}.mp4").exists()
+            (carpeta / f"{v['archivo']}.skip").exists() and not descargado(carpeta / f"{v['archivo']}.mp4")
             for v in curso["videos"]
         ),
     }
 
 
+def descargado(ruta: Path) -> bool:
+    """Existe y no está vacío: un archivo de 0 bytes es una descarga cortada, se vuelve a bajar."""
+    try:
+        return ruta.stat().st_size > 0
+    except OSError:
+        return False
+
+
+DETENIDA = "detenida por el usuario"   # resultado de una descarga cancelada con el botón Detener
+
+
+def marcar_de_internet(ruta: Path, url: str):
+    """Mark-of-the-Web (Windows): igual que un archivo bajado con el navegador, Office lo abre en
+    vista protegida y SmartScreen avisa. Sin esto, las macros de un .docx/.xlsx no se bloquean."""
+    if sys.platform != "win32":
+        return
+    origen = urlparse(url)._replace(query="", fragment="").geturl()   # sin firma ni tokens
+    try:
+        with open(f"{ruta}:Zone.Identifier", "w", encoding="utf-8", newline="") as f:   # \r\n tal cual
+            f.write(f"[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={origen}\r\n")
+    except OSError:
+        pass   # disco sin NTFS (USB FAT32): no hay dónde guardar la marca
+
+
 def carpeta_curso(base_dir: str, curso: dict) -> Path:
-    """<base>/<periodo>/<curso>: aquí cuelgan 'Semana NN/', 'General/' y youtube.html."""
-    return Path(base_dir).expanduser() / curso["periodo"] / sanitizar(curso["nombre"])
+    """<base>/<periodo>/<curso>: aquí cuelgan 'Semana NN/', 'General/' y youtube.html.
+    Falla si la ruta escapa de la carpeta base (periodo/nombre hostil o caché manipulada)."""
+    base = Path(base_dir).expanduser()
+    carpeta = base / sanitizar(curso["periodo"]) / sanitizar(curso["nombre"])
+    if not carpeta.resolve().is_relative_to(base.resolve()):
+        raise ValueError(f"Ruta de curso fuera de la carpeta de descargas: {carpeta}")
+    return carpeta

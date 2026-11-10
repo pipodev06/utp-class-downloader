@@ -7,11 +7,12 @@ Portado de zoom_download.py del proyecto original.
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 from playwright.sync_api import TimeoutError as PwTimeout, sync_playwright
 
 import auth
-from scrape import carpeta_curso, sesion_api
+from scrape import DETENIDA, carpeta_curso, descargado, marcar_de_internet, sesion_api
 
 ERRORES_ZOOM = [
     "esta grabación no existe", "this recording does not exist",
@@ -22,6 +23,12 @@ ERRORES_ZOOM = [
 
 _RE_BOTON_DESCARGA = re.compile(r"^(download|descargar)\s*\(", re.I)
 ZOOM_SSO = "https://utpvirtual.zoom.us/web/sso/login?en=signin"
+_HOST_MICROSOFT = "login.microsoftonline.com"
+
+
+def _host(url: str) -> str:
+    u = urlparse(url)
+    return (u.hostname or "") if u.scheme == "https" else ""
 
 
 class ZoomPideLogin(Exception):
@@ -41,13 +48,15 @@ def _login_zoom(page, log=print):
     log("INFO", "gray", "Iniciando sesión en Zoom (SSO UTP / Microsoft)...")
     page.goto(ZOOM_SSO, wait_until="domcontentloaded", timeout=40000)
     page.get_by_role("button", name="Continue").click()
-    page.wait_for_url("**login.microsoftonline.com/**", timeout=30000)
+    page.wait_for_url(lambda u: _host(u) == _HOST_MICROSOFT, timeout=30000)
     page.locator("input[name=loginfmt]").fill(correo)
     page.locator("#idSIButton9").click()
     try:
         page.locator("input[name=passwd]").wait_for(state="visible", timeout=20000)
     except PwTimeout:
         raise ZoomPideLogin("Microsoft no aceptó el correo UTP para Zoom") from None
+    if _host(page.url) != _HOST_MICROSOFT:   # nunca escribir la clave fuera del login real de Microsoft
+        raise ZoomPideLogin(f"El login de Zoom llevó a un sitio inesperado ({_host(page.url)})")
     page.locator("input[name=passwd]").fill(auth.UTP_PASS)
     page.locator("#idSIButton9").click()
     for _ in range(30):
@@ -84,9 +93,6 @@ def exportar_sesion(sesion_dir: str, url_prueba: str, log=print) -> dict:
             ctx.close()
 
 
-DETENIDA = "detenida por el usuario"
-
-
 def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) -> tuple[str, str]:
     """Una grabación → (estado, mensaje), estado en ok / omitida / fallo / detenida.
     Si se cancela no se marca .fail: queda pendiente para la próxima corrida.
@@ -101,12 +107,13 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
     marca_skip = destino.with_suffix(".skip")
     marca_fail = destino.with_suffix(".fail")
 
-    if destino.exists():
+    if descargado(destino):
         return "ok", f"[ya existe] {titulo[:55]}"
     if marca_skip.exists():
         return "omitida", f"[no existe en Zoom] {titulo[:50]}"
 
-    descargado = {"ok": False}
+    parcial = destino.with_name(destino.name + ".part")
+    resultado = {"ok": False, "error": ""}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -117,12 +124,13 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
         page = ctx.new_page()
 
         def on_dl(dl):
-            if not descargado["ok"]:
+            if not resultado["ok"]:
                 try:
-                    dl.save_as(str(destino))
-                    descargado["ok"] = True
-                except Exception:
-                    pass
+                    dl.save_as(str(parcial))   # a .part: un corte no deja un .mp4 truncado como "completo"
+                    parcial.replace(destino)
+                    resultado["ok"] = True
+                except Exception as e:
+                    resultado["error"] = repr(e)
 
         ctx.on("download", on_dl)
 
@@ -165,7 +173,7 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
                         continue
 
             for i in range(600):
-                if descargado["ok"]:
+                if resultado["ok"]:
                     break
                 if cancelar.is_set():
                     return "detenida", DETENIDA
@@ -180,8 +188,8 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
 
         except ZoomPideLogin:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            resultado["error"] = resultado["error"] or repr(e)
         finally:
             try:
                 ctx.close()
@@ -189,12 +197,14 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
             except Exception:
                 pass
 
-    if destino.exists():
+    parcial.unlink(missing_ok=True)
+    if descargado(destino):
         marca_fail.unlink(missing_ok=True)
+        marcar_de_internet(destino, play_url)
         mb = destino.stat().st_size / 1024 / 1024
         return "ok", f"{titulo[:55]} ({mb:.0f} MB)"
     marca_fail.touch()
-    return "fallo", f"no descargó: {titulo[:55]}"
+    return "fallo", f"no descargó: {titulo[:55]}" + (f" — {resultado['error'][:120]}" if resultado["error"] else "")
 
 
 def descargar_zoom(
@@ -211,7 +221,7 @@ def descargar_zoom(
         carpeta = carpeta_curso(base_dir, curso)
         for g in curso["videos"]:
             destino = carpeta / f"{g['archivo']}.mp4"
-            if destino.exists() or destino.with_suffix(".skip").exists():
+            if descargado(destino) or destino.with_suffix(".skip").exists():
                 ya += 1
                 continue
             pendientes.append({"titulo": g["titulo"], "destino": destino, "grabacion": g["url"]})

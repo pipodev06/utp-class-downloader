@@ -1,8 +1,10 @@
 """
-Módulo de autenticación reutilizable.
-Detecta si hay login pendiente y usa credenciales de .env.
+Login del portal UTP (Keycloak en auth.utp.edu.pe) con UTP_USER/UTP_PASS del .env o de ⚙.
+Zoom usa otro login (SSO Microsoft): ver descargar_zoom._login_zoom.
 """
 import os
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -10,11 +12,18 @@ load_dotenv()
 UTP_USER = os.getenv("UTP_USER")
 UTP_PASS = os.getenv("UTP_PASS")
 
-LOGIN_INDICATORS = ["sso.utp.edu.pe", "login", "signin", "auth", "keycloak"]
+# solo estos servidores pueden recibir la contraseña: se compara el hostname exacto (antes se buscaba
+# "login"/"auth" en cualquier parte de la URL, y cualquier sitio con esa palabra calzaba)
+HOSTS_LOGIN = {"auth.utp.edu.pe", "sso.utp.edu.pe"}
+
+
+def _host_login(url: str) -> bool:
+    u = urlparse(url)
+    return u.scheme == "https" and (u.hostname or "") in HOSTS_LOGIN
+
 
 def necesita_login(page) -> bool:
-    url = page.url.lower()
-    return any(ind in url for ind in LOGIN_INDICATORS)
+    return _host_login(page.url)
 
 def esperar_red(page, timeout: int = 15000):
     """Espera a que la red se calme. El portal UTP nunca llega a 'networkidle'
@@ -33,8 +42,6 @@ def login(page):
     if not UTP_USER or not UTP_PASS:
         raise RuntimeError("UTP_USER y UTP_PASS deben estar en .env — configúralos en ⚙️ Settings")
 
-    print(f"→ Sesión expirada. Logueando como {UTP_USER}...")
-
     # Keycloak / formulario estándar
     try:
         page.wait_for_selector(
@@ -50,7 +57,9 @@ def login(page):
             page.fill(sel, UTP_USER)
             break
 
-    # contraseña
+    # contraseña: se vuelve a comprobar el servidor justo antes de escribirla
+    if not _host_login(page.url):
+        raise RuntimeError(f"El login llevó a un sitio inesperado ({urlparse(page.url).hostname})")
     try:
         page.fill("input[type='password']", UTP_PASS)
     except Exception:
@@ -63,7 +72,6 @@ def login(page):
             break
 
     esperar_red(page)
-    print(f"✓ Login completado → {page.url}")
     return True
 
 def navegar(page, url: str):

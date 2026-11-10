@@ -1,4 +1,5 @@
 import sys
+import html
 import json
 import logging
 import re
@@ -109,6 +110,8 @@ def ordenar_periodos(combo: QComboBox):
 
 
 # ── tareas ──
+COLOR_NIVEL = {"SUCCESS": GREEN, "OK": BLUE, "WARN": ORANGE, "INFO": TEXT_MUTED}   # ventana de logs
+
 ESTADOS_TAREA = {   # metadata.status del portal → (etiqueta, color)
     "NOT_DELIVERED": ("Pendiente", ORANGE),
     "DELIVERED": ("Entregada", GREEN),
@@ -134,12 +137,6 @@ def estilo_flecha_combo() -> str:
         qta.icon("ph.caret-down", color=TEXT_MUTED).pixmap(12, 12).save(str(ruta))
     return f"QComboBox::down-arrow {{ image: url({ruta.as_posix()}); width: 12px; height: 12px; margin-right: 8px; }}"
 
-
-def _fecha(texto: str) -> datetime:
-    try:
-        return datetime.strptime(texto[:19], "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return datetime.max
 
 
 def _faltan(curso: dict) -> tuple[int | None, int | None]:
@@ -497,9 +494,11 @@ class LogsWindow(QDialog):
         layout.addWidget(panel)
 
     def agregar(self, nivel: str, color: str, mensaje: str):
+        # el color lo decide el nivel (los flujos pasan hex/"gray" sueltos; aquí se unifica a la paleta)
+        tono = COLOR_NIVEL.get(nivel, TEXT_MUTED)
         self.texto.append(
-            f'<span style="color:{TEXT_MUTED}">[{nivel}]</span> '
-            f'<span style="color:{TEXT_MAIN}">{mensaje}</span>'
+            f'<span style="color:{tono}">[{nivel}]</span> '
+            f'<span style="color:{TEXT_MAIN}">{html.escape(mensaje)}</span>'
         )
 
 
@@ -885,6 +884,27 @@ class VentanaPrincipal(QMainWindow):
         elif not self._todos_cursos:
             self.label_estado.setText("")
 
+    def closeEvent(self, evento):
+        """Cerrar con un trabajo corriendo: se pide confirmación si es una descarga, se cancela y se
+        espera al hilo (si no, Qt aborta y quedan Chromium/.part huérfanos)."""
+        corriendo = self.worker is not None and self.worker.isRunning()
+        if corriendo and self.btn_detener.isVisible():
+            respuesta = QMessageBox.question(
+                self, "Descarga en curso",
+                "Hay una descarga en curso. ¿Detenerla y salir?\nLo que falte queda pendiente para la próxima vez.",
+            )
+            if respuesta != QMessageBox.StandardButton.Yes:
+                evento.ignore()
+                return
+        if corriendo:
+            self.worker.cancelar.set()
+            self.label_estado.setText("Cerrando...")
+            if not self.worker.wait(20000):   # una grabación de Zoom a medio guardar puede tardar
+                logger.warning("Se cerró la app sin que el trabajo en curso terminara")
+        if getattr(self, "chromium_worker", None) is not None:
+            self.chromium_worker.wait(5000)
+        evento.accept()
+
     def _abrir_logs(self):
         self.logs_window.show()
         self.logs_window.raise_()
@@ -967,6 +987,10 @@ class VentanaPrincipal(QMainWindow):
                 cancelable: bool = False):
         """Arranca un Trabajo en segundo plano con log y progreso conectados.
         cancelable=True muestra el botón Detener mientras corre (descargas; el listado tarda ~3 s)."""
+        # el Trabajo anterior emite 'terminado' justo antes de salir de run(): se espera a que el hilo
+        # termine de verdad, si no Qt aborta con "QThread: Destroyed while thread is still running"
+        if self.worker is not None:
+            self.worker.wait()
         self._unidad_progreso = unidad
         self._set_ocupado(True)
         self.btn_detener.setVisible(cancelable)
@@ -992,17 +1016,19 @@ class VentanaPrincipal(QMainWindow):
             self._login_terminado, "cursos", con_credenciales=True, en_vivo=self._agregar_curso,
         )
 
-    def _cursos_para(self, nombres: list[str] | None) -> list[dict]:
-        """Cursos nombrados, o sin nombres los del periodo filtrado (lo que el usuario está viendo)."""
-        if nombres is None:
+    def _cursos_para(self, claves: list[str] | None) -> list[dict]:
+        """Cursos por clave (scrape.clave_curso), o sin claves los del periodo filtrado.
+        No por nombre: el mismo curso puede repetirse en otro periodo."""
+        if claves is None:
             return self._cursos_visibles()
-        return [c for c in self._todos_cursos if c["nombre"] in nombres]
+        return [c for c in self._todos_cursos if scrape.clave_curso(c) in claves]
 
-    def descargar(self, que: str, nombres: list[str] | None = None):
-        """que = 'materiales' | 'clases'. Sin nombres: los cursos del periodo filtrado."""
-        cursos = self._cursos_para(nombres)
+    def descargar(self, que: str, claves: list[str] | None = None, limpiar_log: bool = True):
+        """que = 'materiales' | 'clases'. Sin claves: los cursos del periodo filtrado."""
+        cursos = self._cursos_para(claves)
         base_dir, paralelo = self.config["base_dir"], self.config["zoom_workers"]
-        self.logs_window.texto.clear()
+        if limpiar_log:
+            self.logs_window.texto.clear()
         self.label_estado.setText(f"Descargando {que} de {len(cursos)} curso(s)...")
         if que == "materiales":
             self._lanzar(
@@ -1041,7 +1067,8 @@ class VentanaPrincipal(QMainWindow):
 
         # descargas hechas con el esquema viejo (archivos/S05_..., videos/): se pasan a Semana NN/
         # una sola vez; necesita el listado para ubicar cada grabación en su semana
-        if self._todos_cursos and migrar_carpetas.hay_esquema_viejo(base_dir):
+        # no durante un listado: sin el listado completo una grabación caería en la semana equivocada
+        if self._todos_cursos and not self._ocupado and migrar_carpetas.hay_esquema_viejo(base_dir):
             migrar_carpetas.migrar(base_dir, self._todos_cursos, log=self._log)
 
         for c in self._todos_cursos:
@@ -1073,6 +1100,7 @@ class VentanaPrincipal(QMainWindow):
         if not materiales_sel and not videos_sel:
             return
 
+        self.logs_window.texto.clear()
         self._cola_seleccionados = []
         if materiales_sel:
             self._cola_seleccionados.append(("materiales", materiales_sel))
@@ -1083,8 +1111,8 @@ class VentanaPrincipal(QMainWindow):
     def _procesar_siguiente_seleccionado(self):
         if not self._cola_seleccionados:
             return
-        que, nombres = self._cola_seleccionados.pop(0)
-        self.descargar(que, nombres)
+        que, claves = self._cola_seleccionados.pop(0)
+        self.descargar(que, claves, limpiar_log=False)   # el log se limpió al armar la cola
 
     def _descarga_terminada(self, resumen: dict | None):
         if self._cola_seleccionados:
@@ -1138,12 +1166,12 @@ class VentanaPrincipal(QMainWindow):
             mat, vid = (None, mat_total, 0), (None, vid_total, 0)
 
         self.arbol.setItemWidget(item, 2, self._crear_celda_conteo(
-            nombre_curso, *mat, self._sel_materiales, self._toggle_sel_materiales, "materiales"))
+            scrape.clave_curso(c), *mat, self._sel_materiales, self._toggle_sel_materiales, "materiales"))
         self.arbol.setItemWidget(item, 3, self._crear_celda_conteo(
-            nombre_curso, *vid, self._sel_videos, self._toggle_sel_videos, "clases"))
+            scrape.clave_curso(c), *vid, self._sel_videos, self._toggle_sel_videos, "clases"))
         self.arbol.setItemWidget(item, 4, self._crear_widget_acciones(c))
 
-    def _crear_celda_conteo(self, nombre_curso: str, ok: int | None, total: int, no_disp: int,
+    def _crear_celda_conteo(self, clave: str, ok: int | None, total: int, no_disp: int,
                             conjunto: set, on_toggle, que: str) -> QWidget:
         """Celda 'descargados / total'. Verde = nada más por bajar; ámbar = faltan; gris = sin datos."""
         if total == 0:
@@ -1164,8 +1192,8 @@ class VentanaPrincipal(QMainWindow):
         fila.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if self._modo_seleccion and total:
             widget = QCheckBox(texto)
-            widget.setChecked(nombre_curso in conjunto)
-            widget.toggled.connect(lambda marcado, n=nombre_curso: on_toggle(n, marcado))
+            widget.setChecked(clave in conjunto)
+            widget.toggled.connect(lambda marcado, k=clave: on_toggle(k, marcado))
             self._widgets_fila.append(widget)
         else:
             widget = QLabel(texto)
@@ -1174,18 +1202,18 @@ class VentanaPrincipal(QMainWindow):
         fila.addWidget(widget)
         return contenedor
 
-    def _toggle_sel_materiales(self, nombre_curso: str, marcado: bool):
+    def _toggle_sel_materiales(self, clave: str, marcado: bool):
         if marcado:
-            self._sel_materiales.add(nombre_curso)
+            self._sel_materiales.add(clave)
         else:
-            self._sel_materiales.discard(nombre_curso)
+            self._sel_materiales.discard(clave)
         self._actualizar_boton_seleccionados()
 
-    def _toggle_sel_videos(self, nombre_curso: str, marcado: bool):
+    def _toggle_sel_videos(self, clave: str, marcado: bool):
         if marcado:
-            self._sel_videos.add(nombre_curso)
+            self._sel_videos.add(clave)
         else:
-            self._sel_videos.discard(nombre_curso)
+            self._sel_videos.discard(clave)
         self._actualizar_boton_seleccionados()
 
     def _crear_widget_acciones(self, c: dict) -> QWidget:
@@ -1211,7 +1239,7 @@ class VentanaPrincipal(QMainWindow):
             btn.setIcon(qta.icon(icono, color=TEXT_MUTED if completo or not total else TEXT_MAIN))
             btn.setIconSize(QSize(14, 14))
             btn.setFixedWidth(120)
-            btn.clicked.connect(lambda _=False, q=que: self.descargar(q, [nombre_curso]))
+            btn.clicked.connect(lambda _=False, q=que: self.descargar(q, [scrape.clave_curso(c)]))
             if not total:
                 btn.setEnabled(False)
                 btn.setToolTip(f"Este curso no tiene {que}")
@@ -1253,10 +1281,17 @@ class VentanaPrincipal(QMainWindow):
                 self.label_estado.setText("Falló — revisa los logs")
                 self.label_resumen_tareas.setText("Sin datos")
             return
+        errores = sum(bool(c.get("error")) for c in cursos)
+        if errores == len(cursos):   # p. ej. token rechazado en todos: no es un listado nuevo
+            self._login_terminado(None)
+            return
         scrape.guardar_cache(CACHE_PATH, cursos)
         self._fecha_listado = datetime.now().isoformat(timespec="minutes")
         # se repinta desde el resultado final: trae 'visto' (tareas nuevas) que se calcula al terminar
         self._mostrar_cursos(cursos)
+        if errores:
+            self.label_estado.setText(f"{self.label_estado.text()} · {errores} curso(s) sin actualizar "
+                                      "(la API falló; se muestra lo anterior)")
         nuevas = sum(scrape.es_nueva(t) for c in cursos for t in c["tareas"])
         if nuevas:
             self._log("SUCCESS", GREEN, f"{nuevas} tarea(s) nueva(s) desde el último listado")
@@ -1276,7 +1311,7 @@ class VentanaPrincipal(QMainWindow):
             for t in c["tareas"]
         ]
         pendientes = [t for t in tareas if t["estado"] == "NOT_DELIVERED"]
-        urgentes = [t for t in pendientes if (_fecha(t["vence"]) - ahora).total_seconds() < 48 * 3600]
+        urgentes = [t for t in pendientes if (scrape.fecha_portal(t["vence"]) - ahora).total_seconds() < 48 * 3600]
         nuevas = [t for t in tareas if scrape.es_nueva(t)]
         self.tabs.setTabText(1, f"Tareas ({len(pendientes)})" if pendientes else "Tareas")
 
@@ -1293,7 +1328,7 @@ class VentanaPrincipal(QMainWindow):
             visibles = nuevas
         else:
             visibles = [t for t in tareas if filtro is None or t["estado"] in filtro]
-        visibles.sort(key=lambda t: (ORDEN_ESTADO.get(t["estado"], 9), not scrape.es_nueva(t), t["vence"]))
+        visibles.sort(key=lambda t: (ORDEN_ESTADO.get(t["estado"], 9), not scrape.es_nueva(t), scrape.fecha_portal(t["vence"])))
         for t in visibles:
             self._agregar_fila_tarea(t, ahora)
         if not visibles:
@@ -1302,7 +1337,7 @@ class VentanaPrincipal(QMainWindow):
             self.arbol_tareas.addTopLevelItem(vacio)
 
     def _agregar_fila_tarea(self, t: dict, ahora: datetime):
-        vence = _fecha(t["vence"])
+        vence = scrape.fecha_portal(t["vence"])
         etiqueta, color = ESTADOS_TAREA.get(t["estado"], (t["estado"] or "—", TEXT_MUTED))
         if t["estado"] == "NOT_DELIVERED" and (vence - ahora).total_seconds() < 48 * 3600:
             color = RED
