@@ -2,6 +2,7 @@
 Login del portal UTP (Keycloak en auth.utp.edu.pe) con UTP_USER/UTP_PASS del .env o de ⚙.
 Zoom usa otro login (SSO Microsoft): ver descargar_zoom._login_zoom.
 """
+
 import os
 from urllib.parse import urlparse
 
@@ -25,6 +26,7 @@ def _host_login(url: str) -> bool:
 def necesita_login(page) -> bool:
     return _host_login(page.url)
 
+
 def esperar_red(page, timeout: int = 15000):
     """Espera a que la red se calme. El portal UTP nunca llega a 'networkidle'
     real (analytics/polling de fondo), así que un timeout aquí no es un error —
@@ -33,6 +35,7 @@ def esperar_red(page, timeout: int = 15000):
         page.wait_for_load_state("networkidle", timeout=timeout)
     except PlaywrightTimeoutError:
         pass
+
 
 def login(page):
     """Loguea si detecta página de autenticación. Retorna True si hizo login."""
@@ -73,6 +76,7 @@ def login(page):
 
     esperar_red(page)
     return True
+
 
 def navegar(page, url: str):
     """Navega a URL y loguea automáticamente si es necesario."""

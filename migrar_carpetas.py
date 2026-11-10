@@ -5,6 +5,7 @@ Pasa las descargas del esquema viejo al de carpetas por semana:
 Solo mueve dentro del mismo disco (instantáneo). Si el destino ya existe con el mismo contenido,
 la copia vieja sobra y se quita; si el contenido es distinto se conservan ambas.
 """
+
 import filecmp
 import re
 from pathlib import Path
@@ -13,7 +14,7 @@ from scrape import carpeta_curso, carpeta_semana, semana_de_texto
 
 _RE_PREFIJO = re.compile(r"^S(\d{2})_(.+)$")
 _CARPETAS_VIEJAS = ("archivos", "videos")
-_COMPARAR_HASTA = 50_000_000   # más grande (videos): basta el tamaño igual para darlo por idéntico
+_COMPARAR_HASTA = 50_000_000  # más grande (videos): basta el tamaño igual para darlo por idéntico
 
 
 def hay_esquema_viejo(base_dir: str) -> bool:
@@ -87,8 +88,16 @@ def migrar(base_dir: str, cursos: list[dict], log=print, simular: bool = False) 
             pass
 
     accion = "Se moverían" if simular else "Movidos"
-    log("SUCCESS", "#22c55e", f"Carpetas por semana: {accion} {r['movidos']} archivo(s)"
+    log(
+        "SUCCESS",
+        "#22c55e",
+        f"Carpetas por semana: {accion} {r['movidos']} archivo(s)"
         + (f", {r['duplicados']} copia(s) idéntica(s) quitada(s)" if r["duplicados"] else "")
-        + (f", {r['conservados_ambos']} con dos versiones distintas (se guardan ambas)" if r["conservados_ambos"] else "")
-        + (f", {r['bloqueados']} en uso por otro programa (se reintenta luego)" if r["bloqueados"] else ""))
+        + (
+            f", {r['conservados_ambos']} con dos versiones distintas (se guardan ambas)"
+            if r["conservados_ambos"]
+            else ""
+        )
+        + (f", {r['bloqueados']} en uso por otro programa (se reintenta luego)" if r["bloqueados"] else ""),
+    )
     return r

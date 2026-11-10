@@ -4,6 +4,7 @@ Exporta la sesión de Playwright y descarga cada grabación en paralelo (headles
   BASE_DIR/<ciclo>/<curso>/Semana NN/<grabación>.mp4
 Portado de zoom_download.py del proyecto original.
 """
+
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,9 +16,14 @@ import auth
 from scrape import DETENIDA, carpeta_curso, descargado, marcar_de_internet, sesion_api
 
 ERRORES_ZOOM = [
-    "esta grabación no existe", "this recording does not exist",
-    "recording does not exist", "3.301", "3301",
-    "no longer available", "ya no está disponible", "has been deleted",
+    "esta grabación no existe",
+    "this recording does not exist",
+    "recording does not exist",
+    "3.301",
+    "3301",
+    "no longer available",
+    "ya no está disponible",
+    "has been deleted",
 ]
 
 
@@ -55,7 +61,7 @@ def _login_zoom(page, log=print):
         page.locator("input[name=passwd]").wait_for(state="visible", timeout=20000)
     except PwTimeout:
         raise ZoomPideLogin("Microsoft no aceptó el correo UTP para Zoom") from None
-    if _host(page.url) != _HOST_MICROSOFT:   # nunca escribir la clave fuera del login real de Microsoft
+    if _host(page.url) != _HOST_MICROSOFT:  # nunca escribir la clave fuera del login real de Microsoft
         raise ZoomPideLogin(f"El login de Zoom llevó a un sitio inesperado ({_host(page.url)})")
     page.locator("input[name=passwd]").fill(auth.UTP_PASS)
     page.locator("#idSIButton9").click()
@@ -69,7 +75,7 @@ def _login_zoom(page, log=print):
             raise ZoomPideLogin("Microsoft rechazó la contraseña para Zoom")
         mantener = page.locator("#KmsiCheckboxField, #idBtn_Back")
         if mantener.count() and mantener.first.is_visible():
-            page.locator("#idSIButton9").click()   # ¿Mantener la sesión iniciada? → Sí
+            page.locator("#idSIButton9").click()  # ¿Mantener la sesión iniciada? → Sí
     raise ZoomPideLogin("El login de Zoom no terminó (¿pide un código de verificación?)")
 
 
@@ -102,7 +108,7 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
     if cancelar.is_set():
         return "detenida", DETENIDA
 
-    destino = rec["destino"]   # <curso>/Semana NN/<nombre>.mp4
+    destino = rec["destino"]  # <curso>/Semana NN/<nombre>.mp4
     destino.parent.mkdir(parents=True, exist_ok=True)
     marca_skip = destino.with_suffix(".skip")
     marca_fail = destino.with_suffix(".fail")
@@ -118,7 +124,8 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         ctx = browser.new_context(
-            storage_state=storage_state, accept_downloads=True,
+            storage_state=storage_state,
+            accept_downloads=True,
             viewport={"width": 1024, "height": 768},
         )
         page = ctx.new_page()
@@ -126,7 +133,7 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
         def on_dl(dl):
             if not resultado["ok"]:
                 try:
-                    dl.save_as(str(parcial))   # a .part: un corte no deja un .mp4 truncado como "completo"
+                    dl.save_as(str(parcial))  # a .part: un corte no deja un .mp4 truncado como "completo"
                     parcial.replace(destino)
                     resultado["ok"] = True
                 except Exception as e:
@@ -139,7 +146,7 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
             page.wait_for_timeout(3000)
 
             if _pide_login(page):
-                raise ZoomPideLogin()   # sin cookies de Zoom: no tiene sentido esperar ni marcar .fail
+                raise ZoomPideLogin()  # sin cookies de Zoom: no tiene sentido esperar ni marcar .fail
 
             body = (page.inner_text("body") or "").lower()
             for err in ERRORES_ZOOM:
@@ -149,8 +156,12 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
                     return "omitida", f"ya no existe en Zoom: {titulo[:50]}"
 
             clicked = False
-            for sel in ["a[download]", "[data-testid='download-btn']",
-                        ".recording-download-btn", "button[aria-label*='Download']"]:
+            for sel in [
+                "a[download]",
+                "[data-testid='download-btn']",
+                ".recording-download-btn",
+                "button[aria-label*='Download']",
+            ]:
                 try:
                     btn = page.query_selector(sel)
                     if btn and btn.is_visible():
@@ -208,8 +219,13 @@ def _descargar_uno(rec: dict, storage_state: dict, cancelar: threading.Event) ->
 
 
 def descargar_zoom(
-    sesion_dir: str, base_dir: str, cursos: list[dict], workers: int = 4,
-    log=print, progreso=lambda actual, total: None, cancelar: threading.Event | None = None,
+    sesion_dir: str,
+    base_dir: str,
+    cursos: list[dict],
+    workers: int = 4,
+    log=print,
+    progreso=lambda actual, total: None,
+    cancelar: threading.Event | None = None,
 ) -> dict:
     """Descarga las grabaciones de 'cursos' (entradas de scrape.listar_todo, sin re-consultar la API).
     Solo lanza navegador para las que faltan: las ya bajadas o marcadas .skip se saltan antes."""
@@ -231,7 +247,7 @@ def descargar_zoom(
     if not pendientes:
         return {"ok": 0, "fail": 0}
 
-    sesion_api(sesion_dir, log=log)   # asegura sesión UTP vigente (login solo si el token venció)
+    sesion_api(sesion_dir, log=log)  # asegura sesión UTP vigente (login solo si el token venció)
 
     log("INFO", "gray", "Comprobando sesión de Zoom...")
     try:
@@ -255,7 +271,7 @@ def descargar_zoom(
                 elif estado != "detenida":
                     log("WARN", "#f59e0b", msg)
             except ZoomPideLogin:
-                if not pide_login:   # se corta todo: las demás grabaciones darían lo mismo
+                if not pide_login:  # se corta todo: las demás grabaciones darían lo mismo
                     pide_login = True
                     cancelar.set()
             except Exception as e:
@@ -265,8 +281,12 @@ def descargar_zoom(
 
     resumen = {"ok": cuenta["ok"], "fail": cuenta["fallo"]}
     if pide_login:
-        log("WARN", "#f59e0b", "Zoom pide iniciar sesión (SSO UTP con Microsoft) — descarga detenida, "
-            "no se marcó ninguna grabación como fallida")
+        log(
+            "WARN",
+            "#f59e0b",
+            "Zoom pide iniciar sesión (SSO UTP con Microsoft) — descarga detenida, "
+            "no se marcó ninguna grabación como fallida",
+        )
         return {**resumen, "zoom_login": True}
     detalle = f"{cuenta['ok']} ok, {cuenta['omitida']} ya no existen en Zoom, {cuenta['fallo']} fallidas"
     if cancelar.is_set():
