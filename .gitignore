@@ -36,3 +36,7 @@ config.json
 
 # caché del último listado (incluye enlaces y tareas)
 cache/
+
+# Interno: solo local (repo público)
+CLAUDE.md
+deuda-fix-bugs-fix-mejoras.md
