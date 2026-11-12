@@ -1,0 +1,22 @@
+# Saltos de línea normalizados a LF en el repo (Windows con core.autocrlf no rompe scripts ni diffs).
+* text=auto eol=lf
+
+# Scripts siempre LF: con CRLF, bash falla ("$'\r': command not found") (mariantools, 2026-11-10).
+*.sh text eol=lf
+
+# Scripts propios de Windows con CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binarios: sin conversión ni diff de texto.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.woff binary
+*.woff2 binary
